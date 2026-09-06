@@ -523,6 +523,35 @@ In `accept-edits` mode, Agent, MCP, and other non-read-only tools still require
 explicit approval. Sub-agents inherit the parent permission mode; because they
 are non-interactive, operations that would require another prompt are denied.
 
+### Permission rules
+
+Rules refine a mode per tool and per call. Each entry is a tool name, or a
+tool name with a glob matched against the call's subject: the command for
+Bash, the path for Read, Write, and Edit, the path or pattern for Glob and
+Grep, the URL for WebFetch, the prompt for Agent. `*` matches every tool.
+
+```toml
+[permissions]
+allow = ["Bash(cargo *)", "Bash(git status)", "Edit(src/**)"]
+deny  = ["Bash(sudo *)", "Bash(rm -rf *)", "Write(.git/**)"]
+ask   = ["Edit(Cargo.toml)", "Read(.env*)"]
+```
+
+Evaluation order for each call:
+
+1. `deny` rules always win, even in `bypass` mode and over a session
+   "always allow".
+2. A session "always allow" from an earlier prompt.
+3. `ask` rules force a prompt where the mode would auto-allow.
+4. `allow` rules skip the prompt the mode would show. They never override
+   `plan` mode's write denial.
+5. Otherwise the mode decides.
+
+A project `.claux.toml` may add `deny` and `ask` rules without trust. It may
+only add `allow` rules when the project is trusted. A malformed rule is a
+configuration error, so a typo in a deny rule cannot be silently skipped.
+Sub-agents inherit the parent's rules.
+
 ## Agent evaluations
 
 Claux has fixture-driven behavioral evaluations for complete multi-round turns,

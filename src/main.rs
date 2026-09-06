@@ -360,18 +360,21 @@ async fn build_engine(
         config.bash_filesystem_policy,
         std::env::current_dir()?,
     )?);
+    let permission_rules = config.permission_rules()?;
     let mut tool_registry = tools::ToolRegistry::new_with_agent_factory(
         agent_factory,
         model.clone(),
         metadata,
         config.permission_mode,
+        permission_rules.clone(),
         config.is_project_trusted(),
         sandbox_policy,
         command_sandbox,
     );
     tool_registry.add_tools(bootstrap::connect_mcp_tools(config).await);
 
-    let permission_checker = permissions::PermissionChecker::new(config.permission_mode);
+    let permission_checker =
+        permissions::PermissionChecker::new(config.permission_mode).with_rules(permission_rules);
     let mut engine = query::Engine::new(provider, tool_registry, permission_checker, model);
     engine.set_model_binding(resolved.binding.clone());
     engine.set_plugins(plugins);

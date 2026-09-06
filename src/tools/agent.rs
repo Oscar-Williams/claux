@@ -8,7 +8,7 @@ use super::{Tool, ToolOutput, ToolRegistry};
 use crate::api::Provider;
 use crate::command_sandbox::CommandSandbox;
 use crate::context;
-use crate::permissions::{PermissionChecker, PermissionMode};
+use crate::permissions::{PermissionChecker, PermissionMode, PermissionRules};
 use crate::query::Engine;
 use crate::sandbox::SandboxPolicy;
 
@@ -24,6 +24,9 @@ pub struct AgentTool {
     /// mode would prompt for is denied rather than auto-run — but Plan's
     /// deny-all-writes and Bypass's allow-all are honored exactly.
     permission_mode: PermissionMode,
+    /// Configured allow/deny/ask rules, inherited so a sub-agent cannot
+    /// escape a rule the parent session is bound by.
+    permission_rules: PermissionRules,
     /// Project trust inherited from the parent session. Sub-agents share the
     /// parent's working directory, so they must apply the same CLAUDE.md
     /// trust gating: an untrusted project must not inject its checked-in
@@ -39,6 +42,7 @@ impl AgentTool {
         model: String,
         metadata: crate::model::ModelMetadata,
         permission_mode: PermissionMode,
+        permission_rules: PermissionRules,
         trusted: bool,
         sandbox_policy: Arc<SandboxPolicy>,
         command_sandbox: Arc<CommandSandbox>,
@@ -48,6 +52,7 @@ impl AgentTool {
             model,
             metadata,
             permission_mode,
+            permission_rules,
             trusted,
             sandbox_policy,
             command_sandbox,
@@ -129,7 +134,8 @@ impl Tool for AgentTool {
         // interactive prompt, so run_turn (non-interactive) denies any tool
         // the mode would Ask about; Bypass still allows all, Plan still
         // denies all writes.
-        let permissions = PermissionChecker::new(self.permission_mode);
+        let permissions =
+            PermissionChecker::new(self.permission_mode).with_rules(self.permission_rules.clone());
 
         let mut engine = Engine::new(provider, tools, permissions, &self.model);
         engine.set_model_metadata(self.metadata);
@@ -235,6 +241,7 @@ mod tests {
             "test".into(),
             crate::model::built_in_metadata("test"),
             mode,
+            PermissionRules::default(),
             true,
             sandbox_policy,
             Arc::new(CommandSandbox::unrestricted_for_tests()),
