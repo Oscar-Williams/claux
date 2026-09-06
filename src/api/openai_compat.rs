@@ -699,12 +699,11 @@ async fn read_openai_sse_body(
                         let _ = tx.send(event).await;
                     }
                     match reason {
-                        "tool_calls" => {
-                            for event in drain_tool_calls(&mut tool_calls)? {
-                                let _ = tx.send(event).await;
-                            }
-                        }
-                        "stop" => {}
+                        // Tool calls are drained at [DONE] or clean EOF, not
+                        // here: a gateway may emit the finish chunk before
+                        // trailing argument deltas, and parsing the buffer
+                        // early would report those calls as malformed.
+                        "tool_calls" | "stop" => {}
                         "length" => {
                             let _ = tx
                                 .send(ApiEvent::Error(ApiFailure::output_limit_exceeded(
@@ -1179,6 +1178,42 @@ mod tests {
             Some(crate::api::ApiFailureKind::MalformedToolArguments)
         );
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_call_arguments_after_the_finish_chunk_are_still_collected() {
+        let response = crate::test_support::sse_response(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/a\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(10);
+
+        read_openai_sse(
+            response,
+            tx,
+            CancellationToken::new(),
+            "openai",
+            "model",
+            false,
+        )
+        .await
+        .unwrap();
+
+        match rx.recv().await {
+            Some(ApiEvent::ToolUse { id, name, input }) => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "Read");
+                assert_eq!(input["file_path"], "/tmp/a");
+            }
+            other => panic!("expected a complete tool call, got {other:?}"),
+        }
+        assert!(matches!(rx.recv().await, Some(ApiEvent::Usage(_))));
+        assert!(matches!(rx.recv().await, Some(ApiEvent::Done)));
     }
 
     #[tokio::test]
