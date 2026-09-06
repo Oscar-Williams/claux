@@ -159,6 +159,8 @@ pub fn repair_history(messages: Vec<Message>) -> Vec<Message> {
     let mut repaired: Vec<Message> = Vec::with_capacity(messages.len());
     // tool_use ids from the most recent assistant message, awaiting results
     let mut pending: Vec<String> = Vec::new();
+    // every tool_use id emitted so far, for duplicate detection
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for msg in messages {
         let is_result_message = matches!(
@@ -171,18 +173,33 @@ pub fn repair_history(messages: Vec<Message>) -> Vec<Message> {
             let MessageContent::Blocks(blocks) = &msg.content else {
                 unreachable!("is_result_message implies Blocks");
             };
-            // Keep results that answer a pending tool_use; drop orphans.
-            let mut kept: Vec<ContentBlock> = blocks
-                .iter()
-                .filter(|b| match b {
-                    ContentBlock::ToolResult { tool_use_id, .. } => pending.contains(tool_use_id),
-                    _ => true,
-                })
-                .cloned()
-                .collect();
-            for block in &kept {
-                if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                    pending.retain(|id| id != tool_use_id);
+            // Keep results that answer a pending tool_use; drop orphans and
+            // any second result for an id that was already answered. A
+            // result whose id was renamed on the assistant side (duplicate
+            // ids, see below) is matched positionally to the renamed use.
+            let mut kept: Vec<ContentBlock> = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let matched =
+                            pending.iter().position(|id| id == tool_use_id).or_else(|| {
+                                let prefix = format!("{tool_use_id}#");
+                                pending.iter().position(|id| id.starts_with(&prefix))
+                            });
+                        if let Some(position) = matched {
+                            let id = pending.remove(position);
+                            kept.push(ContentBlock::ToolResult {
+                                tool_use_id: id,
+                                content: content.clone(),
+                                is_error: *is_error,
+                            });
+                        }
+                    }
+                    other => kept.push(other.clone()),
                 }
             }
             // Results lost for the remaining pending ids: synthesize them
@@ -208,13 +225,41 @@ pub fn repair_history(messages: Vec<Message>) -> Vec<Message> {
             ));
         }
 
-        if let MessageContent::Blocks(blocks) = &msg.content {
-            for block in blocks {
-                if let ContentBlock::ToolUse { id, .. } = block {
-                    pending.push(id.clone());
+        // Collect this message's tool_use ids, renaming duplicates so the
+        // provider never sees two identical ids in one request.
+        let msg = match msg.content {
+            MessageContent::Blocks(blocks) => {
+                let mut renamed = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    match block {
+                        ContentBlock::ToolUse { id, name, input } => {
+                            let mut unique = id.clone();
+                            let mut suffix = 2;
+                            while seen_ids.contains(&unique) {
+                                unique = format!("{id}#{suffix}");
+                                suffix += 1;
+                            }
+                            seen_ids.insert(unique.clone());
+                            pending.push(unique.clone());
+                            renamed.push(ContentBlock::ToolUse {
+                                id: unique,
+                                name,
+                                input,
+                            });
+                        }
+                        other => renamed.push(other),
+                    }
+                }
+                Message {
+                    role: msg.role,
+                    content: MessageContent::Blocks(renamed),
                 }
             }
-        }
+            content => Message {
+                role: msg.role,
+                content,
+            },
+        };
         repaired.push(msg);
     }
 
@@ -353,6 +398,78 @@ mod tests {
         let repaired = repair_history(history);
         assert_eq!(repaired.len(), 5);
         assert_valid_pairing(&repaired);
+    }
+
+    #[test]
+    fn repair_renames_duplicate_tool_use_ids_and_pairs_results_positionally() {
+        use crate::api::types::{ContentBlock, MessageContent};
+        let history = vec![
+            Message::user("go"),
+            Message::assistant_blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "dup".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "dup".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ]),
+            Message::tool_results(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "dup".to_string(),
+                    content: "first".to_string(),
+                    is_error: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "dup".to_string(),
+                    content: "second".to_string(),
+                    is_error: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "dup".to_string(),
+                    content: "third, already answered".to_string(),
+                    is_error: None,
+                },
+            ]),
+            Message::assistant_text("done"),
+        ];
+        let repaired = repair_history(history);
+        assert_valid_pairing(&repaired);
+
+        let MessageContent::Blocks(uses) = &repaired[1].content else {
+            panic!("expected tool_use blocks");
+        };
+        let use_ids: Vec<&str> = uses
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(use_ids, vec!["dup", "dup#2"]);
+
+        let MessageContent::Blocks(results) = &repaired[2].content else {
+            panic!("expected tool_result blocks");
+        };
+        let result_ids: Vec<(&str, &str)> = results
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            result_ids,
+            vec![("dup", "first"), ("dup#2", "second")],
+            "the third result answers nothing and must be dropped"
+        );
     }
 
     #[test]

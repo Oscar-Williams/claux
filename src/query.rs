@@ -894,6 +894,57 @@ impl Engine {
     /// Providers return `anyhow::Error` when the request fails before a stream
     /// exists; the underlying `ApiFailure` carries the classification, so
     /// downcast rather than inspecting the rendered message.
+    /// Make a provider-supplied tool_use id unique within the conversation.
+    ///
+    /// Providers are expected to emit unique ids, but misbehaving gateways
+    /// repeat or omit them. A repeated id would be echoed back as two
+    /// identical tool_use blocks and two identical tool_result ids, which
+    /// the Anthropic protocol rejects on every later request, wedging the
+    /// session. Suffix duplicates and synthesize missing ids instead.
+    fn unique_tool_use_id(
+        &self,
+        id: String,
+        batch: &[(String, String, serde_json::Value)],
+    ) -> String {
+        let mut taken: std::collections::HashSet<&str> =
+            batch.iter().map(|(id, _, _)| id.as_str()).collect();
+        let history_ids: Vec<String> = self
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::api::types::MessageContent::Blocks(blocks) => Some(blocks),
+                crate::api::types::MessageContent::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        taken.extend(history_ids.iter().map(String::as_str));
+
+        let base = if id.trim().is_empty() {
+            tracing::warn!("provider omitted a tool_use id; synthesizing one");
+            format!("call_{}", batch.len() + 1)
+        } else {
+            id
+        };
+        if !taken.contains(base.as_str()) {
+            return base;
+        }
+        let mut suffix = 2;
+        loop {
+            let candidate = format!("{base}#{suffix}");
+            if !taken.contains(candidate.as_str()) {
+                tracing::warn!(
+                    "provider repeated tool_use id {base:?}; renamed duplicate to {candidate:?}"
+                );
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
     fn failure_kind(error: &anyhow::Error) -> ApiFailureKind {
         error
             .downcast_ref::<ApiFailure>()
@@ -1224,6 +1275,7 @@ impl Engine {
                         // reach this before a later call in the same batch is
                         // found to be malformed.
                         committed = true;
+                        let id = self.unique_tool_use_id(id, &tool_uses);
                         tool_uses.push((id, name, input));
                     }
                     ApiEvent::Usage(usage) => {
@@ -1901,6 +1953,90 @@ mod tests {
         calls: Arc<AtomicUsize>,
         systems: Arc<Mutex<Vec<String>>>,
         recover: bool,
+    }
+
+    struct DuplicateToolIdProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for DuplicateToolIdProvider {
+        fn name(&self) -> &str {
+            "duplicate-tool-id"
+        }
+
+        fn set_model(&mut self, _model: &str) {}
+
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<ProviderStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel(8);
+            if call == 0 {
+                for id in ["dup", "dup", ""] {
+                    tx.send(ApiEvent::ToolUse {
+                        id: id.to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"file_path": "/dev/null"}),
+                    })
+                    .await
+                    .unwrap();
+                }
+            } else {
+                tx.send(ApiEvent::Text("done".to_string())).await.unwrap();
+            }
+            tx.send(ApiEvent::Done).await.unwrap();
+            drop(tx);
+            Ok(ProviderStream::new(rx, cancel.child_token()))
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_missing_tool_use_ids_are_made_unique() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(DuplicateToolIdProvider {
+            calls: calls.clone(),
+        });
+        let mut engine =
+            Engine::for_tests(provider, SteeringQueue::default(), PermissionMode::Bypass);
+
+        let result = engine
+            .submit("go", tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result, "done");
+
+        let MessageContent::Blocks(uses) = &engine.messages()[1].content else {
+            panic!("expected assistant tool_use blocks");
+        };
+        let use_ids: Vec<&str> = uses
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(use_ids, vec!["dup", "dup#2", "call_3"]);
+
+        let MessageContent::Blocks(results) = &engine.messages()[2].content else {
+            panic!("expected tool_result blocks");
+        };
+        let result_ids: Vec<&str> = results
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            result_ids, use_ids,
+            "every renamed use must pair with its result"
+        );
     }
 
     struct MidStreamOutputRetryProvider {

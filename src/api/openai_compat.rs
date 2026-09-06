@@ -417,7 +417,17 @@ fn drain_tool_calls(tool_calls: &mut PendingToolCalls) -> Result<Vec<ApiEvent>> 
     calls.sort_by_key(|(index, _)| *index);
     calls
         .into_iter()
-        .map(|(_, (id, name, arguments))| {
+        .map(|(index, (id, name, arguments))| {
+            // The OpenAI schema requires an id, but some compatible servers
+            // omit it. An empty id cannot pair with a tool result, so
+            // synthesize a positional one rather than fail the turn; the
+            // engine makes it unique within the conversation.
+            let id = if id.is_empty() {
+                tracing::warn!("tool call {name} at index {index} omitted its id");
+                format!("call_{index}")
+            } else {
+                id
+            };
             let input = serde_json::from_str(&arguments).map_err(|error| {
                 anyhow::Error::new(ApiFailure::malformed_tool_arguments(format!(
                     "invalid arguments for tool call {name} ({id}): {error}"
@@ -1218,5 +1228,24 @@ mod tests {
                     && error.message.contains("choose another model/provider")
         ));
         assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn drain_synthesizes_a_positional_id_when_the_server_omits_it() {
+        let mut pending: PendingToolCalls = Default::default();
+        pending.insert(1, (String::new(), "Read".to_string(), "{}".to_string()));
+        pending.insert(
+            0,
+            ("call_a".to_string(), "Read".to_string(), "{}".to_string()),
+        );
+        let events = drain_tool_calls(&mut pending).unwrap();
+        let ids: Vec<String> = events
+            .into_iter()
+            .map(|event| match event {
+                ApiEvent::ToolUse { id, .. } => id,
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["call_a".to_string(), "call_1".to_string()]);
     }
 }
