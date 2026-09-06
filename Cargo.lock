@@ -284,6 +284,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "landlock",
+ "nix",
  "process-wrap",
  "pulldown-cmark",
  "ratatui",
