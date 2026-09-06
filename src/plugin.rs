@@ -178,6 +178,34 @@ impl PluginRegistry {
         Ok(parts.join("\n\n"))
     }
 
+    /// Execute plugins for a trigger and return each successful, non-empty
+    /// stdout together with the plugin's name. Used for decision hooks whose
+    /// output is interpreted by the caller rather than injected as context.
+    pub async fn execute_decisions(
+        &self,
+        trigger: &HookTrigger,
+        env_vars: Option<&HashMap<String, String>>,
+    ) -> Vec<(String, String)> {
+        let plugins: Vec<&Box<dyn Plugin>> = self
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.trigger() == trigger)
+            .collect();
+        let results =
+            futures_util::future::join_all(plugins.iter().map(|plugin| plugin.execute(env_vars)))
+                .await;
+
+        let mut decisions = Vec::new();
+        for (plugin, result) in plugins.into_iter().zip(results) {
+            match result {
+                Ok(Some(output)) => decisions.push((plugin.name().to_string(), output)),
+                Ok(None) => {}
+                Err(e) => warn!("Plugin '{}' error: {}", plugin.name(), e),
+            }
+        }
+        decisions
+    }
+
     /// Execute plugins that don't return context (side-effect only, like logging).
     pub async fn execute_side_effects(
         &self,

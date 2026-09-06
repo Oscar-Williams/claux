@@ -1557,18 +1557,18 @@ impl Engine {
         // parallel; the permission check is repeated for sequential tools
         // below because an AlwaysAllow answer during the batch can change
         // later results.
-        let parallel: Vec<usize> = tool_uses
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, name, input))| {
-                let ro = self.tools.is_read_only(name);
-                ro && matches!(
-                    self.permissions.check(name, input, ro),
+        let mut parallel: Vec<usize> = Vec::new();
+        for (idx, (_, name, input)) in tool_uses.iter().enumerate() {
+            let ro = self.tools.is_read_only(name);
+            if ro
+                && matches!(
+                    self.decide_permission(name, input, ro).await,
                     PermissionResult::Allow
                 )
-            })
-            .map(|(idx, _)| idx)
-            .collect();
+            {
+                parallel.push(idx);
+            }
+        }
 
         let mut interrupted = false;
 
@@ -1638,7 +1638,7 @@ impl Engine {
             }
 
             let is_read_only = self.tools.is_read_only(name);
-            let perm = self.permissions.check(name, input, is_read_only);
+            let perm = self.decide_permission(name, input, is_read_only).await;
 
             let started_after_ms = self.trace_offset_ms();
             let started = Instant::now();
@@ -1718,6 +1718,54 @@ impl Engine {
     }
 
     /// Ask the UI for permission and run (or deny) the tool accordingly.
+    /// Run the configured checker, then let `on_permission_check` hooks
+    /// tighten or clear the result. Hooks see the proposed decision and the
+    /// raw input through environment variables and answer with JSON.
+    async fn decide_permission(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        is_read_only: bool,
+    ) -> PermissionResult {
+        let result = self.permissions.check(tool_name, input, is_read_only);
+        let Some(plugins) = &self.plugins else {
+            return result;
+        };
+        if plugins.get_by_trigger(&HookTrigger::OnPermissionCheck) == 0 {
+            return result;
+        }
+
+        let mode = serde_json::to_value(self.permissions.mode())
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let env: std::collections::HashMap<String, String> = [
+            ("CLAUX_TOOL_NAME".to_string(), tool_name.to_string()),
+            ("CLAUX_TOOL_INPUT".to_string(), input.to_string()),
+            ("CLAUX_TOOL_READ_ONLY".to_string(), is_read_only.to_string()),
+            ("CLAUX_PERMISSION_MODE".to_string(), mode),
+            (
+                "CLAUX_PERMISSION_DECISION".to_string(),
+                crate::permissions::proposed_decision(&result).to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut verdicts = Vec::new();
+        for (name, output) in plugins
+            .execute_decisions(&HookTrigger::OnPermissionCheck, Some(&env))
+            .await
+        {
+            match crate::permissions::parse_hook_verdict(&output) {
+                Ok(Some((decision, reason))) => verdicts.push((name, decision, reason)),
+                Ok(None) => {}
+                Err(error) => tracing::warn!("permission hook {name} ignored: {error}"),
+            }
+        }
+        crate::permissions::apply_hook_verdicts(tool_name, input, result, &verdicts)
+    }
+
     async fn ask_permission(
         &mut self,
         name: &str,
@@ -3043,6 +3091,138 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
+    }
+
+    struct VerdictPlugin {
+        output: String,
+        seen_env: Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for VerdictPlugin {
+        fn name(&self) -> &str {
+            "verdict"
+        }
+
+        fn trigger(&self) -> &HookTrigger {
+            &HookTrigger::OnPermissionCheck
+        }
+
+        async fn execute(
+            &self,
+            env_vars: Option<&HashMap<String, String>>,
+        ) -> Result<Option<String>> {
+            *self.seen_env.lock().unwrap() = env_vars.cloned();
+            Ok(Some(self.output.clone()))
+        }
+    }
+
+    async fn tool_result_after_verdict(
+        mode: PermissionMode,
+        verdict: &str,
+    ) -> (String, HashMap<String, String>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(ReadThenDoneProvider {
+            calls: calls.clone(),
+        });
+        let mut engine = Engine::for_tests(provider, SteeringQueue::default(), mode);
+        let seen_env = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = PluginRegistry::new();
+        registry.add(Box::new(VerdictPlugin {
+            output: verdict.to_string(),
+            seen_env: seen_env.clone(),
+        }));
+        engine.set_plugins(Arc::new(registry));
+
+        engine
+            .submit("go", tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+
+        let MessageContent::Blocks(blocks) = &engine.messages()[2].content else {
+            panic!("expected tool_result blocks");
+        };
+        let content = blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("tool result");
+        let env = seen_env.lock().unwrap().clone().expect("hook ran");
+        (content, env)
+    }
+
+    struct ReadThenDoneProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReadThenDoneProvider {
+        fn name(&self) -> &str {
+            "read-then-done"
+        }
+
+        fn set_model(&mut self, _model: &str) {}
+
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<ProviderStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel(4);
+            if call == 0 {
+                tx.send(ApiEvent::ToolUse {
+                    id: "read-1".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({"file_path": "/dev/null"}),
+                })
+                .await
+                .unwrap();
+            } else {
+                tx.send(ApiEvent::Text("done".to_string())).await.unwrap();
+            }
+            tx.send(ApiEvent::Done).await.unwrap();
+            drop(tx);
+            Ok(ProviderStream::new(rx, cancel.child_token()))
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_hook_can_deny_a_tool_the_mode_allows() {
+        let (content, env) = tool_result_after_verdict(
+            PermissionMode::Bypass,
+            r#"{"decision":"deny","reason":"policy says no"}"#,
+        )
+        .await;
+        assert!(content.contains("Permission denied"), "{content}");
+        assert!(
+            content.contains("blocked by hook verdict: policy says no"),
+            "{content}"
+        );
+        assert_eq!(env["CLAUX_TOOL_NAME"], "Read");
+        assert_eq!(env["CLAUX_PERMISSION_DECISION"], "allow");
+        assert_eq!(env["CLAUX_PERMISSION_MODE"], "bypass");
+        assert_eq!(env["CLAUX_TOOL_READ_ONLY"], "true");
+        assert!(env["CLAUX_TOOL_INPUT"].contains("/dev/null"));
+    }
+
+    #[tokio::test]
+    async fn permission_hook_ask_denies_in_non_interactive_mode() {
+        let (content, _) =
+            tool_result_after_verdict(PermissionMode::Bypass, r#"{"decision":"ask"}"#).await;
+        assert!(content.contains("Permission denied"), "{content}");
+        assert!(content.contains("one-shot mode has no prompt"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn permission_hook_with_no_opinion_leaves_the_decision_alone() {
+        let (content, _) = tool_result_after_verdict(PermissionMode::Bypass, "").await;
+        assert!(!content.contains("Permission denied"), "{content}");
     }
 
     #[tokio::test]

@@ -504,11 +504,38 @@ trigger = "on_permission_request"
 | `on_tool_complete` | a tool call finishes |
 | `on_turn_end` | the agent finishes a turn and control returns to you |
 | `on_permission_request` | the agent blocks on a permission prompt (it needs you) |
+| `on_permission_check` | before every tool call; stdout can allow, deny, or ask (see below) |
 
 The example above is a [glow](https://github.com/ducks/glow) status lamp: your
 keyboard's RGB tracks what claux is doing. `on_context_build` is special - its
 stdout is added to the system prompt; the rest are bounded side effects. Hook
 commands run concurrently with a 10-second timeout and bounded captured output.
+
+### Permission check hooks
+
+An `on_permission_check` hook runs before every tool call, after the mode and
+`[permissions]` rules have produced a proposed decision. It receives:
+
+| Variable | Value |
+|----------|-------|
+| `CLAUX_TOOL_NAME` | the tool, e.g. `Bash` |
+| `CLAUX_TOOL_INPUT` | the raw tool input as JSON |
+| `CLAUX_TOOL_READ_ONLY` | `true` or `false` |
+| `CLAUX_PERMISSION_MODE` | the active mode |
+| `CLAUX_PERMISSION_DECISION` | the proposed decision: `allow`, `ask`, or `deny` |
+
+Print nothing to accept the proposal, or print one JSON object:
+
+```json
+{"decision": "deny", "reason": "no network installs on this host"}
+```
+
+The most restrictive answer wins across hooks: any `deny` denies, any `ask`
+turns an allow into a prompt, and `allow` clears a prompt. A deny from a rule
+or from `plan` mode is final; no hook can lift it. Hooks run with the same
+10-second timeout and credential-free environment as other hooks, and a hook
+that fails or prints something other than the JSON object is ignored with a
+warning.
 
 ## Permission Modes
 
@@ -522,6 +549,35 @@ commands run concurrently with a 10-second timeout and bounded captured output.
 In `accept-edits` mode, Agent, MCP, and other non-read-only tools still require
 explicit approval. Sub-agents inherit the parent permission mode; because they
 are non-interactive, operations that would require another prompt are denied.
+
+### Permission rules
+
+Rules refine a mode per tool and per call. Each entry is a tool name, or a
+tool name with a glob matched against the call's subject: the command for
+Bash, the path for Read, Write, and Edit, the path or pattern for Glob and
+Grep, the URL for WebFetch, the prompt for Agent. `*` matches every tool.
+
+```toml
+[permissions]
+allow = ["Bash(cargo *)", "Bash(git status)", "Edit(src/**)"]
+deny  = ["Bash(sudo *)", "Bash(rm -rf *)", "Write(.git/**)"]
+ask   = ["Edit(Cargo.toml)", "Read(.env*)"]
+```
+
+Evaluation order for each call:
+
+1. `deny` rules always win, even in `bypass` mode and over a session
+   "always allow".
+2. A session "always allow" from an earlier prompt.
+3. `ask` rules force a prompt where the mode would auto-allow.
+4. `allow` rules skip the prompt the mode would show. They never override
+   `plan` mode's write denial.
+5. Otherwise the mode decides.
+
+A project `.claux.toml` may add `deny` and `ask` rules without trust. It may
+only add `allow` rules when the project is trusted. A malformed rule is a
+configuration error, so a typo in a deny rule cannot be silently skipped.
+Sub-agents inherit the parent's rules.
 
 ## Agent evaluations
 

@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     }
     if !plugin_registry.is_empty() {
         tracing::info!(
-            "Loaded {} plugin(s): {} context, {} tool-start, {} tool-complete, {} session-start, {} turn-end, {} permission-request",
+            "Loaded {} plugin(s): {} context, {} tool-start, {} tool-complete, {} session-start, {} turn-end, {} permission-request, {} permission-check",
             plugin_registry.len(),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnContextBuild),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnToolStart),
@@ -200,6 +200,7 @@ async fn main() -> Result<()> {
             plugin_registry.get_by_trigger(&config::HookTrigger::OnSessionStart),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnTurnEnd),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnPermissionRequest),
+            plugin_registry.get_by_trigger(&config::HookTrigger::OnPermissionCheck),
         );
     }
     let plugin_registry = Arc::new(plugin_registry);
@@ -360,18 +361,20 @@ async fn build_engine(
         config.bash_filesystem_policy,
         std::env::current_dir()?,
     )?);
+    let permission_policy =
+        permissions::PermissionPolicy::new(config.permission_mode, config.permission_rules()?);
     let mut tool_registry = tools::ToolRegistry::new_with_agent_factory(
         agent_factory,
         model.clone(),
         metadata,
-        config.permission_mode,
+        permission_policy.clone(),
         config.is_project_trusted(),
         sandbox_policy,
         command_sandbox,
     );
     tool_registry.add_tools(bootstrap::connect_mcp_tools(config).await);
 
-    let permission_checker = permissions::PermissionChecker::new(config.permission_mode);
+    let permission_checker = permission_policy.checker();
     let mut engine = query::Engine::new(provider, tool_registry, permission_checker, model);
     engine.set_model_binding(resolved.binding.clone());
     engine.set_plugins(plugins);

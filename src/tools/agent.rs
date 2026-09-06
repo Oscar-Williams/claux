@@ -8,7 +8,9 @@ use super::{Tool, ToolOutput, ToolRegistry};
 use crate::api::Provider;
 use crate::command_sandbox::CommandSandbox;
 use crate::context;
-use crate::permissions::{PermissionChecker, PermissionMode};
+#[cfg(test)]
+use crate::permissions::PermissionMode;
+use crate::permissions::PermissionPolicy;
 use crate::query::Engine;
 use crate::sandbox::SandboxPolicy;
 
@@ -19,11 +21,12 @@ pub struct AgentTool {
     make_provider: ProviderFactory,
     model: String,
     metadata: crate::model::ModelMetadata,
-    /// Permission mode inherited from the parent session. A sub-agent runs
-    /// non-interactively (no prompt to surface), so anything the parent's
-    /// mode would prompt for is denied rather than auto-run — but Plan's
-    /// deny-all-writes and Bypass's allow-all are honored exactly.
-    permission_mode: PermissionMode,
+    /// Permission mode and rules inherited from the parent session. A
+    /// sub-agent runs non-interactively (no prompt to surface), so anything
+    /// the parent's policy would prompt for is denied rather than auto-run;
+    /// Plan's deny-all-writes, Bypass's allow-all, and deny rules are
+    /// honored exactly.
+    permission_policy: PermissionPolicy,
     /// Project trust inherited from the parent session. Sub-agents share the
     /// parent's working directory, so they must apply the same CLAUDE.md
     /// trust gating: an untrusted project must not inject its checked-in
@@ -38,7 +41,7 @@ impl AgentTool {
         make_provider: ProviderFactory,
         model: String,
         metadata: crate::model::ModelMetadata,
-        permission_mode: PermissionMode,
+        permission_policy: PermissionPolicy,
         trusted: bool,
         sandbox_policy: Arc<SandboxPolicy>,
         command_sandbox: Arc<CommandSandbox>,
@@ -47,7 +50,7 @@ impl AgentTool {
             make_provider,
             model,
             metadata,
-            permission_mode,
+            permission_policy,
             trusted,
             sandbox_policy,
             command_sandbox,
@@ -129,7 +132,7 @@ impl Tool for AgentTool {
         // interactive prompt, so run_turn (non-interactive) denies any tool
         // the mode would Ask about; Bypass still allows all, Plan still
         // denies all writes.
-        let permissions = PermissionChecker::new(self.permission_mode);
+        let permissions = self.permission_policy.checker();
 
         let mut engine = Engine::new(provider, tools, permissions, &self.model);
         engine.set_model_metadata(self.metadata);
@@ -234,7 +237,7 @@ mod tests {
             factory,
             "test".into(),
             crate::model::built_in_metadata("test"),
-            mode,
+            PermissionPolicy::new(mode, Default::default()),
             true,
             sandbox_policy,
             Arc::new(CommandSandbox::unrestricted_for_tests()),

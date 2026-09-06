@@ -2,6 +2,131 @@ use serde::{Deserialize, Serialize};
 
 use crate::utils::diff::generate_diff;
 
+/// One configured permission rule: `Tool` or `Tool(pattern)`.
+///
+/// A bare tool name matches every call of that tool. A pattern is matched as
+/// a glob against the call's subject: the command for Bash, the path for
+/// file tools, the URL for WebFetch, the prompt for Agent. `*` as the tool
+/// name matches every tool. Pattern rules never match a tool whose input has
+/// no recognizable subject, so they cannot accidentally widen.
+#[derive(Debug, Clone)]
+pub struct PermissionRule {
+    raw: String,
+    tool: String,
+    pattern: Option<glob::Pattern>,
+}
+
+impl PermissionRule {
+    pub fn parse(rule: &str) -> Result<Self, String> {
+        let raw = rule.trim();
+        if raw.is_empty() {
+            return Err("permission rule is empty".to_string());
+        }
+        let (tool, pattern) = match raw.split_once('(') {
+            Some((tool, rest)) => {
+                let Some(pattern) = rest.strip_suffix(')') else {
+                    return Err(format!(
+                        "permission rule {raw:?} is missing its closing ')'"
+                    ));
+                };
+                (tool.trim(), Some(pattern.trim()))
+            }
+            None => (raw, None),
+        };
+        if tool.is_empty()
+            || !tool
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '*'))
+        {
+            return Err(format!("permission rule {raw:?} has an invalid tool name"));
+        }
+        let pattern = match pattern {
+            Some("") => return Err(format!("permission rule {raw:?} has an empty pattern")),
+            Some(pattern) => Some(
+                glob::Pattern::new(pattern)
+                    .map_err(|error| format!("permission rule {raw:?}: {error}"))?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            raw: raw.to_string(),
+            tool: tool.to_string(),
+            pattern,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn matches(&self, tool_name: &str, input: &serde_json::Value) -> bool {
+        if self.tool != "*" && self.tool != tool_name {
+            return false;
+        }
+        match &self.pattern {
+            None => true,
+            Some(pattern) => rule_subject(tool_name, input)
+                .map(|subject| pattern.matches(subject))
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// The part of a tool call that pattern rules are matched against.
+fn rule_subject<'a>(tool_name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    let keys: &[&str] = match tool_name {
+        "Bash" => &["command"],
+        "Read" | "Write" | "Edit" => &["file_path"],
+        "Glob" | "Grep" => &["path", "pattern"],
+        "WebFetch" => &["url"],
+        "Agent" => &["prompt"],
+        _ => &[
+            "command",
+            "file_path",
+            "path",
+            "url",
+            "pattern",
+            "prompt",
+            "query",
+            "name",
+        ],
+    };
+    keys.iter()
+        .find_map(|key| input.get(key).and_then(|v| v.as_str()))
+}
+
+/// Parsed `[permissions]` rules. Deny wins over ask, ask over allow.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionRules {
+    pub allow: Vec<PermissionRule>,
+    pub deny: Vec<PermissionRule>,
+    pub ask: Vec<PermissionRule>,
+}
+
+impl PermissionRules {
+    pub fn parse(allow: &[String], deny: &[String], ask: &[String]) -> Result<Self, String> {
+        let parse_all = |rules: &[String]| {
+            rules
+                .iter()
+                .map(|rule| PermissionRule::parse(rule))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        Ok(Self {
+            allow: parse_all(allow)?,
+            deny: parse_all(deny)?,
+            ask: parse_all(ask)?,
+        })
+    }
+
+    fn first_match<'a>(
+        rules: &'a [PermissionRule],
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<&'a PermissionRule> {
+        rules.iter().find(|rule| rule.matches(tool_name, input))
+    }
+}
+
 /// How permissions are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -58,8 +183,103 @@ impl PermissionResponse {
     }
 }
 
+/// A decision returned by an `on_permission_check` hook.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookVerdict {
+    decision: HookDecision,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Parse a hook's stdout. Empty output is "no opinion"; anything else must
+/// be the documented JSON object.
+pub fn parse_hook_verdict(output: &str) -> Result<Option<(HookDecision, Option<String>)>, String> {
+    let output = output.trim();
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let verdict: HookVerdict = serde_json::from_str(output)
+        .map_err(|error| format!("hook output is not a decision object: {error}"))?;
+    Ok(Some((verdict.decision, verdict.reason)))
+}
+
+/// The proposed decision as a hook sees it.
+pub fn proposed_decision(result: &PermissionResult) -> &'static str {
+    match result {
+        PermissionResult::Allow => "allow",
+        PermissionResult::Deny(_) => "deny",
+        PermissionResult::Ask { .. } => "ask",
+    }
+}
+
+/// Fold hook verdicts into the checker's result. The most restrictive
+/// verdict wins: any deny denies, any ask escalates an allow to a prompt,
+/// and allow only clears a prompt. A configured or mode deny is final and
+/// no hook can lift it.
+pub fn apply_hook_verdicts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    result: PermissionResult,
+    verdicts: &[(String, HookDecision, Option<String>)],
+) -> PermissionResult {
+    if let PermissionResult::Deny(_) = result {
+        return result;
+    }
+    if let Some((name, _, reason)) = verdicts
+        .iter()
+        .find(|(_, decision, _)| *decision == HookDecision::Deny)
+    {
+        let reason = reason.as_deref().unwrap_or("no reason given");
+        return PermissionResult::Deny(format!("blocked by hook {name}: {reason}"));
+    }
+    if verdicts
+        .iter()
+        .any(|(_, decision, _)| *decision == HookDecision::Ask)
+    {
+        return match result {
+            PermissionResult::Ask { .. } => result,
+            _ => PermissionChecker::ask_for(tool_name, input),
+        };
+    }
+    if verdicts
+        .iter()
+        .any(|(_, decision, _)| *decision == HookDecision::Allow)
+    {
+        return PermissionResult::Allow;
+    }
+    result
+}
+
+/// A mode plus its rules: everything a checker needs, passed as one value
+/// so sub-agents inherit both together.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionPolicy {
+    pub mode: PermissionMode,
+    pub rules: PermissionRules,
+}
+
+impl PermissionPolicy {
+    pub fn new(mode: PermissionMode, rules: PermissionRules) -> Self {
+        Self { mode, rules }
+    }
+
+    pub fn checker(&self) -> PermissionChecker {
+        PermissionChecker::new(self.mode).with_rules(self.rules.clone())
+    }
+}
+
 pub struct PermissionChecker {
     mode: PermissionMode,
+    /// Configured allow/deny/ask rules, evaluated before the mode.
+    rules: PermissionRules,
     /// Tools the user has "always allowed" this session
     session_allows: std::collections::HashSet<String>,
     /// Specific bash commands the user has "always allowed" this session
@@ -70,8 +290,63 @@ impl PermissionChecker {
     pub fn new(mode: PermissionMode) -> Self {
         Self {
             mode,
+            rules: PermissionRules::default(),
             session_allows: std::collections::HashSet::new(),
             bash_command_allows: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn with_rules(mut self, rules: PermissionRules) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
+    }
+
+    /// The prompt a tool call would show if it needed confirmation.
+    pub(crate) fn ask_for(tool_name: &str, input: &serde_json::Value) -> PermissionResult {
+        match tool_name {
+            "Bash" => {
+                let cmd = input["command"].as_str().unwrap_or("");
+                PermissionResult::Ask {
+                    message: format!("bash: {}", truncate(cmd, 80)),
+                    diff: None,
+                }
+            }
+            "Write" => {
+                let path = input["file_path"].as_str().unwrap_or("?");
+                PermissionResult::Ask {
+                    message: format!("write: {path}"),
+                    diff: None,
+                }
+            }
+            "Edit" => {
+                let path = input["file_path"].as_str().unwrap_or("?");
+                let old_string = input["old_string"].as_str().unwrap_or("");
+                let new_string = input["new_string"].as_str().unwrap_or("");
+                let diff = if !old_string.is_empty() && !new_string.is_empty() {
+                    Some(generate_diff(old_string, new_string, path))
+                } else {
+                    None
+                };
+                PermissionResult::Ask {
+                    message: format!("edit: {path}"),
+                    diff,
+                }
+            }
+            "WebFetch" => {
+                let url = input["url"].as_str().unwrap_or("?");
+                PermissionResult::Ask {
+                    message: format!("fetch: {url}"),
+                    diff: None,
+                }
+            }
+            _ => PermissionResult::Ask {
+                message: tool_name.to_string(),
+                diff: None,
+            },
         }
     }
 
@@ -98,6 +373,15 @@ impl PermissionChecker {
         input: &serde_json::Value,
         is_read_only: bool,
     ) -> PermissionResult {
+        // Configured deny rules win over everything, including session
+        // grants and bypass mode.
+        if let Some(rule) = PermissionRules::first_match(&self.rules.deny, tool_name, input) {
+            return PermissionResult::Deny(format!(
+                "blocked by permission rule `{}`",
+                rule.as_str()
+            ));
+        }
+
         // Session-level always-allow overrides
         if self.session_allows.contains(tool_name) {
             return PermissionResult::Allow;
@@ -110,6 +394,18 @@ impl PermissionChecker {
                     return PermissionResult::Allow;
                 }
             }
+        }
+
+        // Configured ask rules force a prompt even where the mode would
+        // auto-allow; configured allow rules skip the prompt the mode would
+        // show. Plan mode's write denial still applies to allow rules.
+        if PermissionRules::first_match(&self.rules.ask, tool_name, input).is_some() {
+            return Self::ask_for(tool_name, input);
+        }
+        if PermissionRules::first_match(&self.rules.allow, tool_name, input).is_some()
+            && (is_read_only || self.mode != PermissionMode::Plan)
+        {
+            return PermissionResult::Allow;
         }
 
         match self.mode {
@@ -467,6 +763,195 @@ mod tests {
 
         assert!(matches!(
             checker.check("Glob", &input, true),
+            PermissionResult::Allow
+        ));
+    }
+
+    fn rules(allow: &[&str], deny: &[&str], ask: &[&str]) -> PermissionRules {
+        let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        PermissionRules::parse(&owned(allow), &owned(deny), &owned(ask)).unwrap()
+    }
+
+    #[test]
+    fn rule_parsing_accepts_bare_and_pattern_forms_and_rejects_malformed() {
+        assert!(PermissionRule::parse("Read").is_ok());
+        assert!(PermissionRule::parse("Bash(git *)").is_ok());
+        assert!(PermissionRule::parse("*").is_ok());
+        assert!(PermissionRule::parse("mcp__github__list_issues").is_ok());
+        for bad in ["", "Bash(", "Bash()", "Ba sh", "Bash(git [)"] {
+            assert!(PermissionRule::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pattern_rules_match_the_tool_subject() {
+        let rule = PermissionRule::parse("Bash(git *)").unwrap();
+        assert!(rule.matches("Bash", &json!({"command": "git status"})));
+        assert!(!rule.matches("Bash", &json!({"command": "gitk"})));
+        assert!(!rule.matches("Write", &json!({"command": "git status"})));
+        // No subject: a pattern rule cannot match.
+        assert!(!rule.matches("Bash", &json!({})));
+
+        let paths = PermissionRule::parse("Edit(src/**)").unwrap();
+        assert!(paths.matches("Edit", &json!({"file_path": "src/a/b.rs"})));
+        assert!(!paths.matches("Edit", &json!({"file_path": "tests/a.rs"})));
+
+        let any = PermissionRule::parse("*").unwrap();
+        assert!(any.matches("mcp__x__y", &json!({})));
+    }
+
+    #[test]
+    fn deny_rules_win_over_bypass_and_session_grants() {
+        let mut checker = PermissionChecker::new(PermissionMode::Bypass).with_rules(rules(
+            &[],
+            &["Bash(rm -rf *)"],
+            &[],
+        ));
+        checker.always_allow("Bash");
+        checker.always_allow_command("rm -rf /");
+        match checker.check("Bash", &json!({"command": "rm -rf /"}), false) {
+            PermissionResult::Deny(reason) => assert!(reason.contains("Bash(rm -rf *)")),
+            _ => panic!("expected Deny"),
+        }
+        assert!(matches!(
+            checker.check("Bash", &json!({"command": "ls"}), false),
+            PermissionResult::Allow
+        ));
+    }
+
+    #[test]
+    fn allow_rules_skip_the_prompt_in_default_mode() {
+        let checker = PermissionChecker::new(PermissionMode::Default).with_rules(rules(
+            &["Bash(cargo *)", "Edit(src/**)"],
+            &[],
+            &[],
+        ));
+        assert!(matches!(
+            checker.check("Bash", &json!({"command": "cargo test"}), false),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("Bash", &json!({"command": "rm x"}), false),
+            PermissionResult::Ask { .. }
+        ));
+        assert!(matches!(
+            checker.check("Edit", &json!({"file_path": "src/lib.rs"}), false),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("Edit", &json!({"file_path": "README.md"}), false),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_rules_do_not_override_plan_mode_writes() {
+        let checker =
+            PermissionChecker::new(PermissionMode::Plan).with_rules(rules(&["Write"], &[], &[]));
+        assert!(matches!(
+            checker.check("Write", &json!({"file_path": "x"}), false),
+            PermissionResult::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn ask_rules_force_a_prompt_where_the_mode_would_allow() {
+        let checker = PermissionChecker::new(PermissionMode::AcceptEdits).with_rules(rules(
+            &[],
+            &[],
+            &["Edit(Cargo.toml)", "Read(.env*)"],
+        ));
+        match checker.check("Edit", &json!({"file_path": "Cargo.toml"}), false) {
+            PermissionResult::Ask { message, .. } => assert!(message.contains("Cargo.toml")),
+            _ => panic!("expected Ask"),
+        }
+        assert!(matches!(
+            checker.check("Edit", &json!({"file_path": "src/main.rs"}), false),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("Read", &json!({"file_path": ".env.local"}), true),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn ask_rules_yield_to_a_session_always_allow() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default).with_rules(rules(
+            &[],
+            &[],
+            &["Bash(cargo *)"],
+        ));
+        assert!(matches!(
+            checker.check("Bash", &json!({"command": "cargo test"}), false),
+            PermissionResult::Ask { .. }
+        ));
+        checker.always_allow_command("cargo test");
+        assert!(matches!(
+            checker.check("Bash", &json!({"command": "cargo test"}), false),
+            PermissionResult::Allow
+        ));
+    }
+
+    #[test]
+    fn hook_verdict_parsing_accepts_empty_and_documented_json_only() {
+        assert_eq!(parse_hook_verdict("  \n").unwrap(), None);
+        assert_eq!(
+            parse_hook_verdict(r#"{"decision":"deny","reason":"nope"}"#).unwrap(),
+            Some((HookDecision::Deny, Some("nope".to_string())))
+        );
+        assert_eq!(
+            parse_hook_verdict(r#"{"decision":"allow"}"#).unwrap(),
+            Some((HookDecision::Allow, None))
+        );
+        assert!(parse_hook_verdict("allow").is_err());
+        assert!(parse_hook_verdict(r#"{"decision":"maybe"}"#).is_err());
+    }
+
+    #[test]
+    fn hook_verdicts_fold_to_the_most_restrictive_and_never_lift_a_deny() {
+        let input = json!({"command": "ls"});
+        let verdict = |d: HookDecision| ("h".to_string(), d, Some("r".to_string()));
+
+        // deny beats allow and ask
+        match apply_hook_verdicts(
+            "Bash",
+            &input,
+            PermissionResult::Allow,
+            &[verdict(HookDecision::Allow), verdict(HookDecision::Deny)],
+        ) {
+            PermissionResult::Deny(reason) => assert!(reason.contains("blocked by hook h: r")),
+            _ => panic!("expected Deny"),
+        }
+        // ask escalates allow
+        assert!(matches!(
+            apply_hook_verdicts(
+                "Bash",
+                &input,
+                PermissionResult::Allow,
+                &[verdict(HookDecision::Ask)]
+            ),
+            PermissionResult::Ask { .. }
+        ));
+        // allow clears ask
+        let ask = PermissionChecker::ask_for("Bash", &input);
+        assert!(matches!(
+            apply_hook_verdicts("Bash", &input, ask, &[verdict(HookDecision::Allow)]),
+            PermissionResult::Allow
+        ));
+        // a configured deny is final
+        assert!(matches!(
+            apply_hook_verdicts(
+                "Bash",
+                &input,
+                PermissionResult::Deny("rule".into()),
+                &[verdict(HookDecision::Allow)]
+            ),
+            PermissionResult::Deny(_)
+        ));
+        // no verdicts: unchanged
+        assert!(matches!(
+            apply_hook_verdicts("Bash", &input, PermissionResult::Allow, &[]),
             PermissionResult::Allow
         ));
     }

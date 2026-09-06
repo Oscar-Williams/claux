@@ -247,6 +247,18 @@ impl ResolvedModel {
     }
 }
 
+/// `[permissions]` rules. Each entry is `Tool` or `Tool(glob)`; see
+/// `permissions::PermissionRule` for matching semantics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PermissionRulesConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_model")]
@@ -288,6 +300,10 @@ pub struct Config {
     /// Operating-system filesystem containment for Bash commands.
     #[serde(default)]
     pub bash_filesystem_policy: BashFilesystemPolicy,
+
+    /// Allow, deny, and ask rules evaluated before `permission_mode`.
+    #[serde(default)]
+    pub permissions: PermissionRulesConfig,
 
     /// Remove `SSH_AUTH_SOCK` and `DOCKER_HOST` from the environment of
     /// Bash commands, hooks, and MCP servers. Provider credentials are
@@ -450,6 +466,9 @@ pub enum HookTrigger {
     OnTurnEnd,
     /// Fires when the agent blocks on a user decision (a permission prompt).
     OnPermissionRequest,
+    /// Fires before every tool call with the proposed decision; stdout may
+    /// return `{"decision": "allow" | "deny" | "ask", "reason": "..."}`.
+    OnPermissionCheck,
 }
 
 fn default_trigger() -> HookTrigger {
@@ -494,6 +513,7 @@ impl Default for Config {
             permission_mode: PermissionMode::Default,
             native_tool_filesystem_policy: NativeToolFilesystemPolicy::default(),
             bash_filesystem_policy: BashFilesystemPolicy::default(),
+            permissions: PermissionRulesConfig::default(),
             strip_agent_sockets: default_strip_agent_sockets(),
             max_tokens: default_max_tokens(),
             auto_compact_threshold: default_auto_compact_threshold(),
@@ -747,6 +767,16 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Parse the configured permission rules, naming the first invalid one.
+    pub fn permission_rules(&self) -> Result<crate::permissions::PermissionRules> {
+        crate::permissions::PermissionRules::parse(
+            &self.permissions.allow,
+            &self.permissions.deny,
+            &self.permissions.ask,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid [permissions] entry: {error}"))
+    }
+
     /// Every environment variable name this configuration may read a
     /// credential from. Agent-spawned children must never inherit them.
     pub fn sensitive_environment_names(&self) -> Vec<String> {
@@ -784,6 +814,9 @@ impl Config {
         }
         config.project_trust = Some(trust);
 
+        // Fail loudly on a malformed rule: a silently skipped deny rule
+        // would be a security regression.
+        config.permission_rules()?;
         Ok(config)
     }
 
@@ -852,6 +885,37 @@ fn apply_project_overrides(config: &mut Config, project: &toml::Value, trusted: 
             }
         }
     }
+    if let Some(permissions) = project
+        .get("permissions")
+        .and_then(|value| value.as_table())
+    {
+        let list = |key: &str| -> Vec<String> {
+            permissions
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Deny and ask rules only tighten, so any project may add them.
+        config.permissions.deny.extend(list("deny"));
+        config.permissions.ask.extend(list("ask"));
+        let allow = list("allow");
+        if !allow.is_empty() {
+            if trusted {
+                config.permissions.allow.extend(allow);
+            } else {
+                tracing::warn!(
+                    "Ignoring project permissions.allow: it would loosen the global policy; \
+                     pass --trust-project or add this directory to trusted_projects"
+                );
+            }
+        }
+    }
     if let Some(strip) = project
         .get("strip_agent_sockets")
         .and_then(|value| value.as_bool())
@@ -916,6 +980,36 @@ name = "ollama"
         assert!(names.contains(&"ANTHROPIC_API_KEY".to_string()));
         assert!(names.contains(&"OPENAI_API_KEY".to_string()));
         assert!(!names.iter().any(|name| name.is_empty()));
+    }
+
+    #[test]
+    fn project_permission_rules_can_add_deny_and_ask_but_allow_needs_trust() {
+        let mut config = Config::default();
+        config.permissions.allow.push("Read".to_string());
+        let project: toml::Value = toml::from_str(
+            "[permissions]\nallow = [\"Bash(rm *)\"]\ndeny = [\"Bash(sudo *)\"]\nask = [\"Edit(Cargo.toml)\"]",
+        )
+        .unwrap();
+
+        apply_project_overrides(&mut config, &project, false);
+        assert_eq!(config.permissions.allow, vec!["Read".to_string()]);
+        assert_eq!(config.permissions.deny, vec!["Bash(sudo *)".to_string()]);
+        assert_eq!(config.permissions.ask, vec!["Edit(Cargo.toml)".to_string()]);
+
+        apply_project_overrides(&mut config, &project, true);
+        assert_eq!(
+            config.permissions.allow,
+            vec!["Read".to_string(), "Bash(rm *)".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_permission_rules_are_reported() {
+        let mut config = Config::default();
+        config.permissions.deny.push("Bash(".to_string());
+        let error = config.permission_rules().unwrap_err().to_string();
+        assert!(error.contains("invalid [permissions] entry"), "{error}");
+        assert!(error.contains("Bash("), "{error}");
     }
 
     #[test]
