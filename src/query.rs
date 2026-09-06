@@ -243,6 +243,19 @@ pub enum StreamEvent {
     Done,
 }
 
+/// What follows a summary compaction in the conversation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Continuation {
+    /// The next message will be a fresh user turn (turn start, manual
+    /// `/compact`), so the summary must not add one of its own.
+    AwaitUserTurn,
+    /// The model must keep working on the task that was in flight
+    /// (mid-turn or context-exceeded recovery), so append a user marker;
+    /// otherwise the request ends with an assistant message, which some
+    /// providers treat as prefill.
+    ResumeTask,
+}
+
 impl Engine {
     pub fn new(
         provider: Box<dyn Provider>,
@@ -674,6 +687,7 @@ impl Engine {
     async fn maybe_auto_compact_with_cancel(
         &mut self,
         cancel: &tokio_util::sync::CancellationToken,
+        continuation: Continuation,
     ) -> Result<Option<String>> {
         // Disabled if threshold is 0.0
         if self.auto_compact_threshold <= 0.0 {
@@ -692,7 +706,7 @@ impl Engine {
                 self.context_window
             );
 
-            self.compact_with_cancel(cancel).await?;
+            self.compact_with_cancel(cancel, continuation).await?;
             let notice = self
                 .last_compaction_notice
                 .clone()
@@ -709,13 +723,17 @@ impl Engine {
     /// 1. Snip — collapse old messages, keep recent ones
     /// 2. Summarize — send conversation to API for full summary
     pub async fn compact(&mut self) -> Result<String> {
-        self.compact_with_cancel(&tokio_util::sync::CancellationToken::new())
-            .await
+        self.compact_with_cancel(
+            &tokio_util::sync::CancellationToken::new(),
+            Continuation::AwaitUserTurn,
+        )
+        .await
     }
 
     async fn compact_with_cancel(
         &mut self,
         cancel: &tokio_util::sync::CancellationToken,
+        continuation: Continuation,
     ) -> Result<String> {
         self.last_compaction_notice = None;
         if self.messages.is_empty() {
@@ -765,7 +783,7 @@ impl Engine {
         // Full summarization. Keep the current history untouched until the
         // provider completes so a failed compact cannot discard context.
         let summary_source = summary_source.unwrap_or_else(|| self.messages.clone());
-        self.summarize_conversation(summary_source, before_context, cancel)
+        self.summarize_conversation(summary_source, before_context, cancel, continuation)
             .await
     }
 
@@ -775,6 +793,7 @@ impl Engine {
         messages: Vec<Message>,
         before_context: usize,
         cancel: &tokio_util::sync::CancellationToken,
+        continuation: Continuation,
     ) -> Result<String> {
         let summary_prompt = "Summarize the conversation so far in a concise paragraph. \
             Focus on what was discussed, what decisions were made, what files were modified, \
@@ -824,15 +843,23 @@ impl Engine {
             anyhow::bail!("Compact error: API stream ended without completion");
         }
 
-        self.commit_compacted_messages(vec![
+        let mut compacted = vec![
             Message::user("Here is a summary of our conversation so far:"),
             Message::assistant_text(&summary),
+        ];
+        if continuation == Continuation::ResumeTask {
             // Providers expect a user turn after a summary. Without this
             // continuation marker the next request ends with an assistant
             // message, which some APIs interpret as a prefill and continue
-            // writing the summary instead of resuming the task.
-            Message::user("Continue with the outstanding task described above."),
-        ]);
+            // writing the summary instead of resuming the task. At turn
+            // start the incoming user prompt supplies that turn instead;
+            // adding a marker there would create two consecutive user
+            // messages, which strict chat templates reject.
+            compacted.push(Message::user(
+                "Continue with the outstanding task described above.",
+            ));
+        }
+        self.commit_compacted_messages(compacted);
         let after_context = self.estimated_context_tokens();
         self.last_compaction_notice = Some(format_compaction_notice(
             "summary",
@@ -989,7 +1016,10 @@ impl Engine {
             let _ = tx.send(StreamEvent::Interrupted).await;
             return Ok(());
         }
-        let compact_notice = match self.maybe_auto_compact_with_cancel(&cancel).await {
+        let compact_notice = match self
+            .maybe_auto_compact_with_cancel(&cancel, Continuation::AwaitUserTurn)
+            .await
+        {
             Ok(notice) => notice,
             Err(_) if cancel.is_cancelled() => {
                 let _ = tx.send(StreamEvent::Interrupted).await;
@@ -1101,7 +1131,10 @@ impl Engine {
                                     "compacting conversation...".to_string(),
                                 ))
                                 .await;
-                            if let Err(error) = self.compact_with_cancel(&cancel).await {
+                            if let Err(error) = self
+                                .compact_with_cancel(&cancel, Continuation::ResumeTask)
+                                .await
+                            {
                                 if cancel.is_cancelled() {
                                     let _ = tx.send(StreamEvent::Interrupted).await;
                                     return Ok(());
@@ -1260,7 +1293,10 @@ impl Engine {
                                             "compacting conversation...".to_string(),
                                         ))
                                         .await;
-                                    if let Err(error) = self.compact_with_cancel(&cancel).await {
+                                    if let Err(error) = self
+                                        .compact_with_cancel(&cancel, Continuation::ResumeTask)
+                                        .await
+                                    {
                                         if cancel.is_cancelled() {
                                             let _ = tx.send(StreamEvent::Interrupted).await;
                                             return Ok(());
@@ -1424,7 +1460,10 @@ impl Engine {
             // user turn. Checking only at the turn boundary lets that history
             // grow all the way to the provider limit, so compact at the safe
             // boundary after tool results have paired every tool call.
-            let compact_notice = match self.maybe_auto_compact_with_cancel(&cancel).await {
+            let compact_notice = match self
+                .maybe_auto_compact_with_cancel(&cancel, Continuation::ResumeTask)
+                .await
+            {
                 Ok(notice) => notice,
                 Err(_) if cancel.is_cancelled() => {
                     let _ = tx.send(StreamEvent::Interrupted).await;
@@ -3220,7 +3259,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            engine.compact_with_cancel(&cancel),
+            engine.compact_with_cancel(&cancel, Continuation::ResumeTask),
         )
         .await
         .expect("compaction should stop promptly")
@@ -3294,13 +3333,84 @@ mod tests {
 
         engine.compact().await.unwrap();
 
-        assert_eq!(engine.messages().len(), 3);
-        assert!(matches!(
-            engine.messages().last().map(|message| &message.content),
-            Some(MessageContent::Text(text))
-                if text == "Continue with the outstanding task described above."
-        ));
+        // A manual compact is followed by the user's next prompt, so no
+        // continuation marker is added.
+        assert_eq!(engine.messages().len(), 2);
+        assert!(!has_consecutive_user_messages(engine.messages()));
         assert_eq!(resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn turn_start_compaction_does_not_produce_consecutive_user_messages() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(CompactionTrackingProvider {
+            resets: resets.clone(),
+            complete: true,
+        });
+        let mut engine =
+            Engine::for_tests(provider, SteeringQueue::default(), PermissionMode::Bypass);
+        let large_message = "context ".repeat(10_000);
+        for index in 0..13 {
+            engine
+                .messages_mut()
+                .push(Message::user(&format!("{index}: {large_message}")));
+        }
+
+        engine
+            .submit("next prompt", tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resets.load(Ordering::SeqCst),
+            1,
+            "auto-compact must have run"
+        );
+        let messages = engine.messages();
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Text(text) if text == "Here is a summary of our conversation so far:"
+        ));
+        assert!(
+            !has_consecutive_user_messages(messages),
+            "turn-start compaction must let the incoming prompt be the user turn"
+        );
+        assert!(messages.iter().any(|message| {
+            matches!(&message.content, MessageContent::Text(text) if text == "next prompt")
+        }));
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compaction_keeps_a_continuation_marker() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(WithinTurnCompactionProvider {
+            calls: calls.clone(),
+        });
+        let mut engine =
+            Engine::for_tests(provider, SteeringQueue::default(), PermissionMode::Bypass);
+
+        engine
+            .submit(
+                "repair the host",
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(engine.messages().iter().any(|message| {
+            matches!(
+                &message.content,
+                MessageContent::Text(text)
+                    if text == "Continue with the outstanding task described above."
+            )
+        }));
+        assert!(!has_consecutive_user_messages(engine.messages()));
+    }
+
+    fn has_consecutive_user_messages(messages: &[Message]) -> bool {
+        messages
+            .windows(2)
+            .any(|pair| pair[0].role == "user" && pair[1].role == "user")
     }
 
     #[tokio::test]
@@ -3322,7 +3432,7 @@ mod tests {
 
         assert_eq!(
             engine.messages().len(),
-            3,
+            2,
             "a larger snip candidate should fall back to summary compaction"
         );
         assert_eq!(resets.load(Ordering::SeqCst), 1);
