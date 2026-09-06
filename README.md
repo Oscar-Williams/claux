@@ -232,7 +232,10 @@ openai_base_url = "http://localhost:11434/v1"
 openai_provider_name = "ollama"
 ```
 
-API keys via command also remain supported (works with 1Password, Vault, etc.):
+API keys via command also remain supported (works with 1Password, Vault, etc.).
+The command runs through `sh -c` (`cmd /C` on Windows) with no stdin and is
+killed after 30 seconds, so a secret manager waiting for an interactive unlock
+fails with a warning and claux falls back to the environment variable:
 
 ```toml
 model = "gpt-4o"
