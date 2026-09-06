@@ -167,6 +167,10 @@ async fn main() -> Result<()> {
 
     // Load config (global + project)
     let mut config = config::Config::load(args.trust_project)?;
+    command_sandbox::configure_child_environment(
+        config.sensitive_environment_names(),
+        config.strip_agent_sockets,
+    );
     if let Some(ref mode) = args.permission_mode {
         config.permission_mode = serde_json::from_value(serde_json::Value::String(mode.clone()))
             .map_err(|_| {

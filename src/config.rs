@@ -228,6 +228,12 @@ pub struct Config {
     #[serde(default)]
     pub bash_filesystem_policy: BashFilesystemPolicy,
 
+    /// Remove `SSH_AUTH_SOCK` and `DOCKER_HOST` from the environment of
+    /// Bash commands, hooks, and MCP servers. Provider credentials are
+    /// always removed; this only controls the agent/daemon socket handles.
+    #[serde(default = "default_strip_agent_sockets")]
+    pub strip_agent_sockets: bool,
+
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
 
@@ -409,6 +415,10 @@ fn default_auto_compact_threshold() -> f64 {
     0.8 // 80% of context window
 }
 
+fn default_strip_agent_sockets() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -423,6 +433,7 @@ impl Default for Config {
             permission_mode: PermissionMode::Default,
             native_tool_filesystem_policy: NativeToolFilesystemPolicy::default(),
             bash_filesystem_policy: BashFilesystemPolicy::default(),
+            strip_agent_sockets: default_strip_agent_sockets(),
             max_tokens: default_max_tokens(),
             auto_compact_threshold: default_auto_compact_threshold(),
             openai_base_url: None,
@@ -675,6 +686,22 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Every environment variable name this configuration may read a
+    /// credential from. Agent-spawned children must never inherit them.
+    pub fn sensitive_environment_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key_env.clone())
+            .collect();
+        names.push(self.api_key_env.clone());
+        names.push(self.openai_api_key_env.clone());
+        names.retain(|name| !name.trim().is_empty());
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn load(force_project_trust: bool) -> Result<Self> {
         let global_path = Self::global_path();
 
@@ -764,6 +791,21 @@ fn apply_project_overrides(config: &mut Config, project: &toml::Value, trusted: 
             }
         }
     }
+    if let Some(strip) = project
+        .get("strip_agent_sockets")
+        .and_then(|value| value.as_bool())
+    {
+        // Stripping is the tighter setting: any project may turn it on, but
+        // only a trusted project may hand agent sockets to its commands.
+        if strip || trusted {
+            config.strip_agent_sockets = strip;
+        } else {
+            tracing::warn!(
+                "Ignoring project strip_agent_sockets=false: it would loosen the global policy; \
+                 pass --trust-project or add this directory to trusted_projects"
+            );
+        }
+    }
     if let Some(policy) = project
         .get("bash_filesystem_policy")
         .and_then(|value| value.as_str())
@@ -790,6 +832,50 @@ fn apply_project_overrides(config: &mut Config, project: &toml::Value, trusted: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensitive_environment_names_include_every_configured_key_variable() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.gateway]
+type = "openai"
+base_url = "https://gateway.example/v1"
+name = "gateway"
+api_key_env = "MY_GATEWAY_TOKEN"
+
+[providers.local]
+type = "openai"
+base_url = "http://localhost:11434/v1"
+name = "ollama"
+"#,
+        )
+        .unwrap();
+        let names = config.sensitive_environment_names();
+        assert!(names.contains(&"MY_GATEWAY_TOKEN".to_string()));
+        assert!(names.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(names.contains(&"OPENAI_API_KEY".to_string()));
+        assert!(!names.iter().any(|name| name.is_empty()));
+    }
+
+    #[test]
+    fn strip_agent_sockets_defaults_on_and_projects_can_only_tighten() {
+        let mut config = Config::default();
+        assert!(config.strip_agent_sockets);
+
+        let project: toml::Value = toml::from_str("strip_agent_sockets = false").unwrap();
+        apply_project_overrides(&mut config, &project, false);
+        assert!(
+            config.strip_agent_sockets,
+            "untrusted project must not loosen"
+        );
+
+        apply_project_overrides(&mut config, &project, true);
+        assert!(!config.strip_agent_sockets, "trusted project may loosen");
+
+        let project: toml::Value = toml::from_str("strip_agent_sockets = true").unwrap();
+        apply_project_overrides(&mut config, &project, false);
+        assert!(config.strip_agent_sockets, "any project may tighten");
+    }
 
     #[test]
     fn openai_defaults_to_standard_environment_and_legacy_protocol() {
