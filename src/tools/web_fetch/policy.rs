@@ -78,17 +78,58 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     if ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
+        // fc00::/7 unique local
         || (segments[0] & 0xfe00) == 0xfc00
+        // fe80::/10 link-local
         || (segments[0] & 0xffc0) == 0xfe80
+        // fec0::/10 site-local (deprecated but still routed by some stacks)
+        || (segments[0] & 0xffc0) == 0xfec0
+        // 2001:db8::/32 documentation
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        // 2001::/32 Teredo: tunnels to an arbitrary IPv4 host
+        || (segments[0] == 0x2001 && segments[1] == 0x0000)
+        // 2001:2::/48 benchmarking
+        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000)
+        // 2001:10::/28 and 2001:20::/28 ORCHID
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020)
+        // 64:ff9b:1::/48 local-use NAT64
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001)
     {
         return false;
     }
 
-    if let Some(ipv4) = ip.to_ipv4_mapped() {
+    // Transition prefixes embed an IPv4 address; judge the embedded one so
+    // a private IPv4 target cannot be reached through the IPv6 form.
+    if let Some(ipv4) = embedded_ipv4(&segments) {
         return is_public_ipv4(ipv4);
     }
     true
+}
+
+/// The IPv4 address carried by an IPv4-mapped, IPv4-compatible, NAT64, or
+/// 6to4 IPv6 address.
+fn embedded_ipv4(segments: &[u16; 8]) -> Option<Ipv4Addr> {
+    let from_pair = |high: u16, low: u16| {
+        Ipv4Addr::new(
+            (high >> 8) as u8,
+            (high & 0xff) as u8,
+            (low >> 8) as u8,
+            (low & 0xff) as u8,
+        )
+    };
+    match segments {
+        // ::ffff:a.b.c.d (IPv4-mapped)
+        [0, 0, 0, 0, 0, 0xffff, high, low] => Some(from_pair(*high, *low)),
+        // ::a.b.c.d (IPv4-compatible, deprecated); :: and ::1 are handled
+        // earlier by is_unspecified/is_loopback
+        [0, 0, 0, 0, 0, 0, high, low] => Some(from_pair(*high, *low)),
+        // 64:ff9b::a.b.c.d (well-known NAT64 prefix)
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => Some(from_pair(*high, *low)),
+        // 2002:abcd:efgh::/48 (6to4)
+        [0x2002, high, low, ..] => Some(from_pair(*high, *low)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -119,12 +160,36 @@ mod tests {
             "::1",
             "fc00::1",
             "fe80::1",
+            "fec0::1",
             "2001:db8::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:2f::1",
             "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            // IPv4-compatible
+            "::10.0.0.1",
+            "::a00:1",
+            // NAT64 well-known and local-use prefixes
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::8.8.8.8",
+            // 6to4 carrying private IPv4
+            "2002:a00:1::1",
+            "2002:c0a8:101::1",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
         }
-        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+        for ip in [
+            "2606:4700:4700::1111",
+            "::ffff:8.8.8.8",
+            "64:ff9b::8.8.8.8",
+            "2002:808:808::1",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[tokio::test]
