@@ -118,10 +118,6 @@ impl PermissionRules {
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.allow.is_empty() && self.deny.is_empty() && self.ask.is_empty()
-    }
-
     fn first_match<'a>(
         rules: &'a [PermissionRule],
         tool_name: &str,
@@ -260,6 +256,24 @@ pub fn apply_hook_verdicts(
         return PermissionResult::Allow;
     }
     result
+}
+
+/// A mode plus its rules: everything a checker needs, passed as one value
+/// so sub-agents inherit both together.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionPolicy {
+    pub mode: PermissionMode,
+    pub rules: PermissionRules,
+}
+
+impl PermissionPolicy {
+    pub fn new(mode: PermissionMode, rules: PermissionRules) -> Self {
+        Self { mode, rules }
+    }
+
+    pub fn checker(&self) -> PermissionChecker {
+        PermissionChecker::new(self.mode).with_rules(self.rules.clone())
+    }
 }
 
 pub struct PermissionChecker {

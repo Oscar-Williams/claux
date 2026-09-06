@@ -71,14 +71,14 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// Create a registry with Agent tool using a provider factory. The
-    /// `permission_mode` is inherited by sub-agents the Agent tool spawns,
-    /// so a sub-agent can't run with more authority than the parent session.
+    /// permission policy (mode and rules) is inherited by sub-agents the
+    /// Agent tool spawns, so a sub-agent can't run with more authority than
+    /// the parent session.
     pub fn new_with_agent_factory(
         factory: agent::ProviderFactory,
         model: String,
         metadata: crate::model::ModelMetadata,
-        permission_mode: crate::permissions::PermissionMode,
-        permission_rules: crate::permissions::PermissionRules,
+        permission_policy: crate::permissions::PermissionPolicy,
         trusted: bool,
         sandbox_policy: Arc<SandboxPolicy>,
         command_sandbox: Arc<CommandSandbox>,
@@ -97,8 +97,7 @@ impl ToolRegistry {
                     factory,
                     model,
                     metadata,
-                    permission_mode,
-                    permission_rules,
+                    permission_policy,
                     trusted,
                     sandbox_policy,
                     command_sandbox,
@@ -253,8 +252,7 @@ mod tests {
             factory,
             "model".into(),
             crate::model::built_in_metadata("model"),
-            crate::permissions::PermissionMode::Default,
-            crate::permissions::PermissionRules::default(),
+            crate::permissions::PermissionPolicy::default(),
             true,
             Arc::new(SandboxPolicy::unrestricted_for_tests()),
             Arc::new(CommandSandbox::unrestricted_for_tests()),
