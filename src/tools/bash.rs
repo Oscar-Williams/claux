@@ -2,8 +2,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
-#[cfg(unix)]
-use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -11,10 +9,15 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolOutput};
 use crate::command_sandbox::CommandSandbox;
+
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct BashTool {
     sandbox: Arc<CommandSandbox>,
@@ -89,13 +92,13 @@ impl Tool for BashTool {
 
         let mut inner = self.sandbox.command(&params.command)?;
         inner.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        inner.process_group(0);
         let mut command = CommandWrap::from(inner);
         // Commands commonly create descendants (shell pipelines, test runners,
         // build systems). Put the whole tree in one killable unit so cancelling
         // the tool cannot leave grandchildren alive with our pipes still open.
         command.wrap(KillOnDrop);
-        #[cfg(unix)]
-        command.wrap(ProcessGroup::leader());
         #[cfg(windows)]
         command.wrap(JobObject);
 
@@ -108,6 +111,7 @@ impl Tool for BashTool {
                 });
             }
         };
+        let process_group = child.id();
 
         // Take the pipes so we can read them concurrently with wait().
         let mut stdout_pipe = child.stdout().take();
@@ -115,14 +119,14 @@ impl Tool for BashTool {
 
         // Spawn readers so partial output is captured even if we get cancelled
         // or time out mid-stream.
-        let stdout_task = tokio::spawn(async move {
+        let mut stdout_task = tokio::spawn(async move {
             let mut buf = Vec::new();
             if let Some(p) = stdout_pipe.as_mut() {
                 let _ = p.read_to_end(&mut buf).await;
             }
             buf
         });
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut buf = Vec::new();
             if let Some(p) = stderr_pipe.as_mut() {
                 let _ = p.read_to_end(&mut buf).await;
@@ -131,18 +135,25 @@ impl Tool for BashTool {
         });
 
         let outcome = tokio::select! {
-            status = child.wait() => Outcome::Finished(status),
+            status = wait_for_parent(&mut child) => Outcome::Finished(status),
             _ = cancel.cancelled() => Outcome::Cancelled,
             _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
         };
 
-        // For Cancelled / TimedOut, the child is still alive — kill it.
+        // A shell can exit successfully while a background descendant remains
+        // alive and holds stdout/stderr open. Always terminate anything left
+        // in the command's process tree before draining output. Persistent
+        // services must detach into their own service manager and redirect
+        // their streams rather than inheriting a tool invocation's pipes.
+        let residual_processes_terminated = terminate_process_tree(&mut child, process_group);
+
         if !matches!(outcome, Outcome::Finished(_)) {
-            let _ = Box::into_pin(child.kill()).await;
+            let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, wait_for_parent(&mut child)).await;
         }
 
-        let stdout = stdout_task.await.unwrap_or_default();
-        let stderr = stderr_task.await.unwrap_or_default();
+        let (stdout, stdout_abandoned) = drain_reader(&mut stdout_task).await;
+        let (stderr, stderr_abandoned) = drain_reader(&mut stderr_task).await;
+        let output_abandoned = stdout_abandoned || stderr_abandoned;
 
         let stdout_s = render_output(&stdout, "stdout");
         let stderr_s = render_output(&stderr, "stderr");
@@ -158,7 +169,7 @@ impl Tool for BashTool {
             content.push_str(&stderr_s);
         }
 
-        let is_error = match &outcome {
+        let mut is_error = match &outcome {
             Outcome::Finished(Ok(status)) => {
                 if !status.success() {
                     content.push_str(&format!("\nExit code: {status}"));
@@ -188,12 +199,77 @@ impl Tool for BashTool {
             }
         };
 
+        if matches!(outcome, Outcome::Finished(Ok(status)) if status.success())
+            && residual_processes_terminated
+        {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(
+                "Background processes were terminated when the command exited. Use a service manager for persistent processes.",
+            );
+            is_error = true;
+        }
+
+        if output_abandoned {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(
+                "A detached process kept command output open; Claux stopped waiting for its output.",
+            );
+            is_error = true;
+        }
+
         if content.len() > 100_000 {
             content.truncate(100_000);
             content.push_str("\n... (output truncated)");
         }
 
         Ok(ToolOutput { content, is_error })
+    }
+}
+
+async fn wait_for_parent(
+    child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(
+    _child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
+    process_group: Option<u32>,
+) -> bool {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    process_group
+        .and_then(|pid| i32::try_from(pid).ok())
+        .is_some_and(|pid| killpg(Pid::from_raw(pid), Signal::SIGKILL).is_ok())
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(
+    child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
+    _process_group: Option<u32>,
+) -> bool {
+    child.start_kill().is_ok()
+}
+
+async fn drain_reader(task: &mut JoinHandle<Vec<u8>>) -> (Vec<u8>, bool) {
+    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *task).await {
+        Ok(Ok(output)) => (output, false),
+        Ok(Err(_)) => (Vec::new(), false),
+        Err(_) => {
+            task.abort();
+            (Vec::new(), true)
+        }
     }
 }
 
@@ -332,5 +408,56 @@ mod tests {
         );
         assert!(result.is_error);
         assert!(result.content.contains("Interrupted"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_process_cannot_hold_a_completed_command_open() {
+        let start = std::time::Instant::now();
+        let result = tool()
+            .execute(
+                json!({
+                    "command": "nohup sleep 30 >/dev/null 2>&1 & printf ready",
+                    "timeout": 60000
+                }),
+                token(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "background descendants must not hold the tool open (took {:?})",
+            start.elapsed()
+        );
+        assert!(result.is_error);
+        assert!(result.content.contains("ready"));
+        assert!(result
+            .content
+            .contains("Background processes were terminated"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn detached_process_cannot_hold_output_capture_open() {
+        let start = std::time::Instant::now();
+        let result = tool()
+            .execute(
+                json!({
+                    "command": "setsid sh -c 'sleep 2' & printf ready",
+                    "timeout": 60000
+                }),
+                token(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "escaped descendants must not hold the tool open (took {:?})",
+            start.elapsed()
+        );
+        assert!(result.is_error);
+        assert!(result.content.contains("stopped waiting"));
     }
 }
