@@ -112,29 +112,90 @@ pub struct ResolvedModel {
     pub api_key_cmd: Option<String>,
 }
 
+/// Upper bound on a credential command. Secret managers that wait for an
+/// interactive unlock would otherwise block startup indefinitely.
+const CREDENTIAL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run an `api_key_cmd` through the platform shell with closed stdin and a
+/// deadline, returning trimmed stdout.
+fn run_credential_command(
+    command: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, String> {
+    use std::process::{Command, Stdio};
+
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = Command::new("cmd");
+        process.args(["/D", "/C", command]);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = Command::new("sh");
+        process.args(["-c", command]);
+        process
+    };
+    let mut child = process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start {command:?}: {error}"))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{command:?} did not finish within {}s",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for {command:?}: {error}"));
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not read output of {command:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{command:?} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 impl ResolvedModel {
     pub fn resolve_api_key(&self) -> Option<String> {
         if let Some(key) = self.api_key.as_deref().filter(|key| !key.is_empty()) {
             return Some(key.to_string());
         }
         if let Some(command) = self.api_key_cmd.as_deref() {
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !key.is_empty() {
-                        return Some(key);
-                    }
-                }
-                Ok(output) => tracing::warn!(
-                    "credential command failed ({}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
+            match run_credential_command(command, CREDENTIAL_COMMAND_TIMEOUT) {
+                Ok(key) if !key.is_empty() => return Some(key),
+                Ok(_) => tracing::warn!(
+                    "credential command for provider {} printed nothing; falling back to ${}",
+                    self.binding.provider,
+                    self.binding.api_key_env
                 ),
-                Err(error) => tracing::warn!("credential command failed to start: {error}"),
+                Err(error) => tracing::warn!(
+                    "credential command for provider {} failed: {error}; falling back to ${}",
+                    self.binding.provider,
+                    self.binding.api_key_env
+                ),
             }
         }
         std::env::var(&self.binding.api_key_env)
@@ -875,6 +936,40 @@ name = "ollama"
         let project: toml::Value = toml::from_str("strip_agent_sockets = true").unwrap();
         apply_project_overrides(&mut config, &project, false);
         assert!(config.strip_agent_sockets, "any project may tighten");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_command_returns_trimmed_stdout() {
+        let key =
+            run_credential_command("printf '  sk-test  \n'", std::time::Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(key, "sk-test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_command_reports_failure_status_and_stderr() {
+        let error = run_credential_command(
+            "echo unlock first >&2; exit 3",
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("exit status: 3"), "{error}");
+        assert!(error.contains("unlock first"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_command_is_killed_after_the_deadline() {
+        let started = std::time::Instant::now();
+        let error =
+            run_credential_command("sleep 30", std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the command must be killed, not awaited"
+        );
     }
 
     #[test]
