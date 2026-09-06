@@ -445,6 +445,21 @@ sandbox. Claux never retries a sandbox-denied command unrestricted. A trusted
 project may explicitly select `unrestricted`; an untrusted project may only
 tighten the global policy.
 
+### Child process environment
+
+Bash commands, hooks, and MCP servers start with a copy of claux's environment
+that has provider credentials removed: every `api_key_env` named in the loaded
+configuration, plus any variable ending in `_API_KEY` or starting with
+`ANTHROPIC_`, `OPENAI_`, `OPENROUTER_`, `AI_GATEWAY_`, or `OPENCODE_`. Keys
+resolved with `api_key_cmd` never enter the environment at all.
+
+By default `SSH_AUTH_SOCK` and `DOCKER_HOST` are removed as well, so a command
+run by the model cannot use your SSH agent or reach a remote Docker daemon.
+This also means `git push` over an agent-held key and rootless or remote
+Docker do not work inside the Bash tool. Set `strip_agent_sockets = false` in
+the global config to keep those handles; a project `.claux.toml` may only
+turn stripping on unless the project is trusted.
+
 ## Hooks
 
 Run a command on a lifecycle event. Each `[[plugins]]` entry runs its

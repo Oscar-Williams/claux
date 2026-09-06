@@ -6,20 +6,77 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
+use std::sync::RwLock;
 use tokio::process::Command;
 
-/// Environment variables that must never be inherited by agent-spawned
-/// processes. Provider credentials are intentionally kept in claux's process
-/// only; shells, hooks, and MCP servers do not need them to do their work.
-fn is_sensitive_environment_name(name: &OsStr) -> bool {
+/// Process-wide policy for the environment handed to agent-spawned children.
+///
+/// Provider credentials are intentionally kept in claux's process only;
+/// shells, hooks, and MCP servers do not need them to do their work. The
+/// fixed pattern list covers the vendors claux knows about; `extra_names`
+/// carries every `api_key_env` a loaded configuration actually resolves, so
+/// custom variable names are protected too.
+#[derive(Clone, Debug)]
+struct ChildEnvironmentPolicy {
+    extra_names: HashSet<String>,
+    strip_agent_sockets: bool,
+}
+
+impl Default for ChildEnvironmentPolicy {
+    fn default() -> Self {
+        Self {
+            extra_names: HashSet::new(),
+            strip_agent_sockets: true,
+        }
+    }
+}
+
+static CHILD_ENVIRONMENT_POLICY: RwLock<Option<ChildEnvironmentPolicy>> = RwLock::new(None);
+
+fn child_environment_policy() -> ChildEnvironmentPolicy {
+    CHILD_ENVIRONMENT_POLICY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Register the credential variable names from the loaded configuration and
+/// whether agent/daemon socket variables are stripped from children.
+///
+/// Call once after configuration is resolved; later calls replace the policy.
+pub fn configure_child_environment(
+    sensitive_names: impl IntoIterator<Item = String>,
+    strip_agent_sockets: bool,
+) {
+    let policy = ChildEnvironmentPolicy {
+        extra_names: sensitive_names
+            .into_iter()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| name.to_ascii_uppercase())
+            .collect(),
+        strip_agent_sockets,
+    };
+    *CHILD_ENVIRONMENT_POLICY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(policy);
+}
+
+/// Variables that point children at a credential-bearing agent or daemon.
+fn is_agent_socket_name(name: &str) -> bool {
+    name == "SSH_AUTH_SOCK" || name == "DOCKER_HOST"
+}
+
+fn is_sensitive_environment_name_with(name: &OsStr, policy: &ChildEnvironmentPolicy) -> bool {
     let name = name.to_string_lossy().to_ascii_uppercase();
-    name == "SSH_AUTH_SOCK"
-        || name == "DOCKER_HOST"
+    (policy.strip_agent_sockets && is_agent_socket_name(&name))
+        || policy.extra_names.contains(&name)
         || name.ends_with("_API_KEY")
         || name.starts_with("ANTHROPIC_")
         || name.starts_with("OPENAI_")
@@ -29,7 +86,8 @@ fn is_sensitive_environment_name(name: &OsStr) -> bool {
 }
 
 fn sanitized_environment() -> impl Iterator<Item = (OsString, OsString)> {
-    std::env::vars_os().filter(|(name, _)| !is_sensitive_environment_name(name))
+    let policy = child_environment_policy();
+    std::env::vars_os().filter(move |(name, _)| !is_sensitive_environment_name_with(name, &policy))
 }
 
 /// Replace a child command's inherited environment with a credential-free
@@ -463,14 +521,67 @@ mod tests {
 
     #[test]
     fn sensitive_environment_names_are_filtered() {
-        assert!(is_sensitive_environment_name(OsStr::new("OPENAI_API_KEY")));
-        assert!(is_sensitive_environment_name(OsStr::new(
-            "CLAUX_TEST_API_KEY"
-        )));
-        assert!(is_sensitive_environment_name(OsStr::new("SSH_AUTH_SOCK")));
-        assert!(!is_sensitive_environment_name(OsStr::new(
-            "CLAUX_TEST_NORMAL"
-        )));
+        let policy = ChildEnvironmentPolicy::default();
+        let sensitive = |name: &str| is_sensitive_environment_name_with(OsStr::new(name), &policy);
+        assert!(sensitive("OPENAI_API_KEY"));
+        assert!(sensitive("CLAUX_TEST_API_KEY"));
+        assert!(sensitive("SSH_AUTH_SOCK"));
+        assert!(sensitive("DOCKER_HOST"));
+        assert!(!sensitive("CLAUX_TEST_NORMAL"));
+        assert!(!sensitive("MY_GATEWAY_TOKEN"));
+    }
+
+    #[test]
+    fn configured_credential_names_are_filtered_regardless_of_pattern() {
+        // Names are stored uppercased (see `configure_child_environment`).
+        let policy = ChildEnvironmentPolicy {
+            extra_names: ["MY_GATEWAY_TOKEN".to_string()].into_iter().collect(),
+            strip_agent_sockets: true,
+        };
+        assert!(is_sensitive_environment_name_with(
+            OsStr::new("MY_GATEWAY_TOKEN"),
+            &policy
+        ));
+        assert!(is_sensitive_environment_name_with(
+            OsStr::new("my_gateway_token"),
+            &policy
+        ));
+        assert!(!is_sensitive_environment_name_with(
+            OsStr::new("MY_GATEWAY_TOKEN_FILE"),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn configure_child_environment_normalizes_and_applies_names() {
+        configure_child_environment(vec!["my_gateway_token".to_string(), "  ".to_string()], true);
+        let policy = child_environment_policy();
+        let sensitive = |name: &str| is_sensitive_environment_name_with(OsStr::new(name), &policy);
+        assert!(sensitive("MY_GATEWAY_TOKEN"));
+        assert!(sensitive("my_gateway_token"));
+        assert!(!sensitive("CLAUX_TEST_NORMAL"));
+        // Reset so other tests observe defaults.
+        configure_child_environment(Vec::<String>::new(), true);
+    }
+
+    #[test]
+    fn agent_socket_stripping_can_be_disabled_without_exposing_credentials() {
+        let policy = ChildEnvironmentPolicy {
+            extra_names: HashSet::new(),
+            strip_agent_sockets: false,
+        };
+        assert!(!is_sensitive_environment_name_with(
+            OsStr::new("SSH_AUTH_SOCK"),
+            &policy
+        ));
+        assert!(!is_sensitive_environment_name_with(
+            OsStr::new("DOCKER_HOST"),
+            &policy
+        ));
+        assert!(is_sensitive_environment_name_with(
+            OsStr::new("OPENAI_API_KEY"),
+            &policy
+        ));
     }
 
     #[test]
