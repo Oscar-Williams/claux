@@ -466,6 +466,9 @@ pub enum HookTrigger {
     OnTurnEnd,
     /// Fires when the agent blocks on a user decision (a permission prompt).
     OnPermissionRequest,
+    /// Fires before every tool call with the proposed decision; stdout may
+    /// return `{"decision": "allow" | "deny" | "ask", "reason": "..."}`.
+    OnPermissionCheck,
 }
 
 fn default_trigger() -> HookTrigger {

@@ -187,6 +187,81 @@ impl PermissionResponse {
     }
 }
 
+/// A decision returned by an `on_permission_check` hook.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookVerdict {
+    decision: HookDecision,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Parse a hook's stdout. Empty output is "no opinion"; anything else must
+/// be the documented JSON object.
+pub fn parse_hook_verdict(output: &str) -> Result<Option<(HookDecision, Option<String>)>, String> {
+    let output = output.trim();
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let verdict: HookVerdict = serde_json::from_str(output)
+        .map_err(|error| format!("hook output is not a decision object: {error}"))?;
+    Ok(Some((verdict.decision, verdict.reason)))
+}
+
+/// The proposed decision as a hook sees it.
+pub fn proposed_decision(result: &PermissionResult) -> &'static str {
+    match result {
+        PermissionResult::Allow => "allow",
+        PermissionResult::Deny(_) => "deny",
+        PermissionResult::Ask { .. } => "ask",
+    }
+}
+
+/// Fold hook verdicts into the checker's result. The most restrictive
+/// verdict wins: any deny denies, any ask escalates an allow to a prompt,
+/// and allow only clears a prompt. A configured or mode deny is final and
+/// no hook can lift it.
+pub fn apply_hook_verdicts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    result: PermissionResult,
+    verdicts: &[(String, HookDecision, Option<String>)],
+) -> PermissionResult {
+    if let PermissionResult::Deny(_) = result {
+        return result;
+    }
+    if let Some((name, _, reason)) = verdicts
+        .iter()
+        .find(|(_, decision, _)| *decision == HookDecision::Deny)
+    {
+        let reason = reason.as_deref().unwrap_or("no reason given");
+        return PermissionResult::Deny(format!("blocked by hook {name}: {reason}"));
+    }
+    if verdicts
+        .iter()
+        .any(|(_, decision, _)| *decision == HookDecision::Ask)
+    {
+        return match result {
+            PermissionResult::Ask { .. } => result,
+            _ => PermissionChecker::ask_for(tool_name, input),
+        };
+    }
+    if verdicts
+        .iter()
+        .any(|(_, decision, _)| *decision == HookDecision::Allow)
+    {
+        return PermissionResult::Allow;
+    }
+    result
+}
+
 pub struct PermissionChecker {
     mode: PermissionMode,
     /// Configured allow/deny/ask rules, evaluated before the mode.
@@ -217,7 +292,7 @@ impl PermissionChecker {
     }
 
     /// The prompt a tool call would show if it needed confirmation.
-    fn ask_for(tool_name: &str, input: &serde_json::Value) -> PermissionResult {
+    pub(crate) fn ask_for(tool_name: &str, input: &serde_json::Value) -> PermissionResult {
         match tool_name {
             "Bash" => {
                 let cmd = input["command"].as_str().unwrap_or("");
@@ -800,6 +875,69 @@ mod tests {
         checker.always_allow_command("cargo test");
         assert!(matches!(
             checker.check("Bash", &json!({"command": "cargo test"}), false),
+            PermissionResult::Allow
+        ));
+    }
+
+    #[test]
+    fn hook_verdict_parsing_accepts_empty_and_documented_json_only() {
+        assert_eq!(parse_hook_verdict("  \n").unwrap(), None);
+        assert_eq!(
+            parse_hook_verdict(r#"{"decision":"deny","reason":"nope"}"#).unwrap(),
+            Some((HookDecision::Deny, Some("nope".to_string())))
+        );
+        assert_eq!(
+            parse_hook_verdict(r#"{"decision":"allow"}"#).unwrap(),
+            Some((HookDecision::Allow, None))
+        );
+        assert!(parse_hook_verdict("allow").is_err());
+        assert!(parse_hook_verdict(r#"{"decision":"maybe"}"#).is_err());
+    }
+
+    #[test]
+    fn hook_verdicts_fold_to_the_most_restrictive_and_never_lift_a_deny() {
+        let input = json!({"command": "ls"});
+        let verdict = |d: HookDecision| ("h".to_string(), d, Some("r".to_string()));
+
+        // deny beats allow and ask
+        match apply_hook_verdicts(
+            "Bash",
+            &input,
+            PermissionResult::Allow,
+            &[verdict(HookDecision::Allow), verdict(HookDecision::Deny)],
+        ) {
+            PermissionResult::Deny(reason) => assert!(reason.contains("blocked by hook h: r")),
+            _ => panic!("expected Deny"),
+        }
+        // ask escalates allow
+        assert!(matches!(
+            apply_hook_verdicts(
+                "Bash",
+                &input,
+                PermissionResult::Allow,
+                &[verdict(HookDecision::Ask)]
+            ),
+            PermissionResult::Ask { .. }
+        ));
+        // allow clears ask
+        let ask = PermissionChecker::ask_for("Bash", &input);
+        assert!(matches!(
+            apply_hook_verdicts("Bash", &input, ask, &[verdict(HookDecision::Allow)]),
+            PermissionResult::Allow
+        ));
+        // a configured deny is final
+        assert!(matches!(
+            apply_hook_verdicts(
+                "Bash",
+                &input,
+                PermissionResult::Deny("rule".into()),
+                &[verdict(HookDecision::Allow)]
+            ),
+            PermissionResult::Deny(_)
+        ));
+        // no verdicts: unchanged
+        assert!(matches!(
+            apply_hook_verdicts("Bash", &input, PermissionResult::Allow, &[]),
             PermissionResult::Allow
         ));
     }

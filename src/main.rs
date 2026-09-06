@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     }
     if !plugin_registry.is_empty() {
         tracing::info!(
-            "Loaded {} plugin(s): {} context, {} tool-start, {} tool-complete, {} session-start, {} turn-end, {} permission-request",
+            "Loaded {} plugin(s): {} context, {} tool-start, {} tool-complete, {} session-start, {} turn-end, {} permission-request, {} permission-check",
             plugin_registry.len(),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnContextBuild),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnToolStart),
@@ -200,6 +200,7 @@ async fn main() -> Result<()> {
             plugin_registry.get_by_trigger(&config::HookTrigger::OnSessionStart),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnTurnEnd),
             plugin_registry.get_by_trigger(&config::HookTrigger::OnPermissionRequest),
+            plugin_registry.get_by_trigger(&config::HookTrigger::OnPermissionCheck),
         );
     }
     let plugin_registry = Arc::new(plugin_registry);
