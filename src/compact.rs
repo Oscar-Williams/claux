@@ -1,10 +1,8 @@
-//! Compaction strategies for managing context window usage.
+//! Context estimation and task-preserving compaction helpers.
 //!
-//! Mirrors Claude Code's multi-strategy compaction pipeline:
-//! 1. Tool output truncation — cap large tool results before they enter history
-//! 2. Snip compaction — collapse old messages keeping recent N
-//! 3. Full summary — summarize entire conversation via API call
-//! 4. Reactive compact — triggered on prompt-too-long (413) errors
+//! Tool outputs are capped before entering history. Compaction summarizes the
+//! intact conversation and retains the original request verbatim; older context
+//! is never replaced by a marker before the model has summarized it.
 
 use crate::api::types::{ContentBlock, Message, MessageContent};
 
@@ -92,82 +90,44 @@ pub fn truncate_tool_output(output: &str) -> (String, bool) {
     (result, true)
 }
 
-/// True if the message carries any tool_result blocks.
-fn contains_tool_result(msg: &Message) -> bool {
-    match &msg.content {
-        MessageContent::Text(_) => false,
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
-    }
-}
+/// Keep the handoff focused on information the next model round needs to act.
+/// Later user corrections take precedence over the retained original request.
+pub const SUMMARY_PROMPT: &str = "Summarize the conversation into a compact task handoff.
+Do not continue the task or call tools. Use these sections:
+- Objective: the current user goal, including changes to the original request.
+- Constraints: user requirements, prohibitions, preferences, and later corrections.
+- Decisions: choices made and the reasons that still matter.
+- Progress: completed work, changed file paths, test results, and failures.
+- Outstanding work: remaining steps, blockers, and the immediate next action.
+Preserve concrete paths, identifiers, and unresolved errors needed to resume.
+Distinguish completed work from plans. Later user instructions supersede earlier
+ones. Carry forward still-relevant details from any earlier handoff. Do not
+invent missing facts; use 'None' for empty sections. Keep it concise.";
 
-/// Snip compaction: collapse old messages into a brief marker,
-/// keeping the most recent `keep_recent` messages intact.
-/// Returns the new message list if snipping occurred, or None if
-/// there weren't enough messages to snip.
-pub fn snip_old_messages(messages: &[Message], keep_recent: usize) -> Option<Vec<Message>> {
-    if messages.len() <= keep_recent + 2 {
-        return None; // Not enough to snip
-    }
-
-    let mut snip_count = messages.len() - keep_recent;
-
-    // The kept window must not open with tool_result blocks: their matching
-    // tool_use would be on the snipped side of the cut, and the API rejects
-    // a conversation containing tool_results with no preceding tool_use.
-    // Walk the cut back (keeping more messages) until the boundary is safe.
-    // tool_results immediately follow their tool_use message, so this only
-    // ever backs up past complete tool rounds.
-    while snip_count > 0 && contains_tool_result(&messages[snip_count]) {
-        snip_count -= 1;
-    }
-    if snip_count == 0 {
-        return None; // No safe cut point; nothing to snip
-    }
-    let snipped = &messages[..snip_count];
-    let kept = &messages[snip_count..];
-
-    // Count what we're removing
-    let snip_tokens = estimate_tokens(snipped);
-
-    let marker = Message::user(&format!(
-        "[{snip_count} earlier messages snipped (~{snip_tokens} tokens). The conversation continues below.]"
-    ));
-
-    let mut result = vec![marker];
-    result.extend_from_slice(kept);
-
-    Some(result)
-}
-
-/// Determine if compaction should be triggered based on estimated token usage.
-/// Returns the recommended strategy.
-#[cfg(test)]
-pub enum CompactStrategy {
-    /// No compaction needed
-    None,
-    /// Snip old messages (light)
-    Snip,
-    /// Full summarization (heavy)
-    Summarize,
-}
-
-/// Check what compaction strategy to use based on token estimates.
-/// Uses model context window as reference.
-#[cfg(test)]
-pub fn should_compact(messages: &[Message], context_window: usize) -> CompactStrategy {
-    let tokens = estimate_tokens(messages);
-    let threshold_snip = context_window * 60 / 100; // 60% — snip
-    let threshold_summarize = context_window * 80 / 100; // 80% — full summary
-
-    if tokens > threshold_summarize {
-        CompactStrategy::Summarize
-    } else if tokens > threshold_snip {
-        CompactStrategy::Snip
-    } else {
-        CompactStrategy::None
-    }
+/// Pin the first actual user request, including attached images. Because this
+/// message remains first after compaction, repeated compaction and session resume
+/// retain it without separate metadata or a storage migration.
+pub fn original_request(messages: &[Message]) -> Option<Message> {
+    messages
+        .iter()
+        .find(|message| {
+            message.role == "user"
+                && match &message.content {
+                    MessageContent::Text(text) => !text.trim().is_empty(),
+                    MessageContent::Blocks(blocks) => {
+                        !blocks
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                            && blocks.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { .. } | ContentBlock::Image { .. }
+                                )
+                            })
+                    }
+                }
+        })
+        .cloned()
 }
 
 /// Context window sizes for known models.
@@ -223,146 +183,29 @@ mod tests {
     }
 
     #[test]
-    fn snip_not_enough_messages() {
-        let msgs = vec![Message::user("hi"), Message::assistant_text("hello")];
-        assert!(snip_old_messages(&msgs, 5).is_none());
-    }
-
-    #[test]
-    fn snip_keeps_recent() {
-        let msgs: Vec<Message> = (0..20)
-            .map(|i| Message::user(&format!("message {i}")))
-            .collect();
-
-        let result = snip_old_messages(&msgs, 5).unwrap();
-        // Should have: 1 snip marker + 5 recent
-        assert_eq!(result.len(), 6);
-        // Last message should be the original last
-        if let MessageContent::Text(text) = &result.last().unwrap().content {
-            assert_eq!(text, "message 19");
-        }
-    }
-
-    /// Every tool_result in the list must have a matching tool_use earlier.
-    /// This is the invariant the Anthropic API enforces on requests.
-    fn assert_no_orphaned_tool_results(messages: &[Message]) {
-        let mut seen_tool_use_ids = std::collections::HashSet::new();
-        for msg in messages {
-            if let MessageContent::Blocks(blocks) = &msg.content {
-                for block in blocks {
-                    match block {
-                        ContentBlock::ToolUse { id, .. } => {
-                            seen_tool_use_ids.insert(id.clone());
-                        }
-                        ContentBlock::ToolResult { tool_use_id, .. } => {
-                            assert!(
-                                seen_tool_use_ids.contains(tool_use_id),
-                                "orphaned tool_result: {tool_use_id}"
-                            );
-                        }
-                        ContentBlock::Text { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Reasoning { .. } => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// One user → assistant(tool_use) → user(tool_result) round.
-    fn tool_round(n: usize) -> Vec<Message> {
-        vec![
-            Message::user(&format!("request {n}")),
-            Message::assistant_blocks(vec![ContentBlock::ToolUse {
-                id: format!("tu_{n}"),
-                name: "Read".to_string(),
-                input: serde_json::json!({"file_path": "/tmp/x"}),
-            }]),
+    fn original_request_skips_tool_results_and_preserves_images() {
+        let request = Message::user_with_images(
+            "fix this screenshot",
+            vec![crate::api::types::ImageSource {
+                source_type: "base64".into(),
+                media_type: "image/png".into(),
+                data: "image-data".into(),
+            }],
+        );
+        let messages = vec![
             Message::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: format!("tu_{n}"),
-                content: "contents".to_string(),
+                tool_use_id: "old".into(),
+                content: "old output".into(),
                 is_error: None,
             }]),
-        ]
-    }
-
-    #[test]
-    fn snip_never_orphans_tool_results() {
-        // Regression: the cut point used to land on arbitrary messages. If
-        // the kept window opened with a tool_result whose tool_use was
-        // snipped, the next API request 400'd. Try every keep_recent value
-        // against a conversation of tool rounds so cut points land on every
-        // message kind.
-        let mut msgs: Vec<Message> = Vec::new();
-        for n in 0..6 {
-            msgs.extend(tool_round(n));
-        }
-
-        for keep_recent in 1..msgs.len() {
-            if let Some(snipped) = snip_old_messages(&msgs, keep_recent) {
-                assert_no_orphaned_tool_results(&snipped);
-            }
-        }
-    }
-
-    #[test]
-    fn snip_backs_up_to_include_tool_use() {
-        // 18 messages of tool rounds; keep_recent=4 puts the naive cut at
-        // index 14, which is a tool_result message (pattern repeats every 3:
-        // user, assistant tool_use, user tool_result). The cut must back up
-        // to keep the matching tool_use.
-        let mut msgs: Vec<Message> = Vec::new();
-        for n in 0..6 {
-            msgs.extend(tool_round(n));
-        }
-
-        let snipped = snip_old_messages(&msgs, 4).unwrap();
-        assert_no_orphaned_tool_results(&snipped);
-        // Marker + at least keep_recent messages survive
-        assert!(snipped.len() > 4);
-        // First kept message after the marker is the assistant tool_use,
-        // not its orphaned result
-        if let MessageContent::Blocks(blocks) = &snipped[1].content {
-            assert!(matches!(blocks[0], ContentBlock::ToolUse { .. }));
-        } else {
-            panic!("expected the kept window to open with the tool_use message");
-        }
-    }
-
-    #[test]
-    fn snip_returns_none_when_no_safe_cut() {
-        // A conversation that is one giant unfinished tool cascade from
-        // index 1 on: every candidate cut lands on a tool_result, walking
-        // back to 0. Must return None rather than produce an invalid list.
-        let mut msgs = vec![Message::user("start")];
-        msgs.push(Message::assistant_blocks(vec![ContentBlock::ToolUse {
-            id: "tu_0".to_string(),
-            name: "Read".to_string(),
-            input: serde_json::json!({}),
-        }]));
-        for _ in 0..8 {
-            msgs.push(Message::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: "tu_0".to_string(),
-                content: "x".to_string(),
-                is_error: None,
-            }]));
-        }
-
-        // keep_recent=2: naive cut at index 8, all tool_results back to
-        // index 2, then index 1 is the tool_use... which is safe, actually.
-        // Force the unsafe case by asking to cut inside the results run
-        // starting at index 1.
-        let all_results: Vec<Message> = msgs[2..].to_vec();
-        assert!(snip_old_messages(&all_results, 2).is_none());
-    }
-
-    #[test]
-    fn should_compact_small_conversation() {
-        let msgs = vec![Message::user("hi")];
-        assert!(matches!(
-            should_compact(&msgs, 200_000),
-            CompactStrategy::None
-        ));
+            request.clone(),
+            Message::assistant_text("working"),
+        ];
+        assert_eq!(
+            serde_json::to_value(original_request(&messages).unwrap()).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+        assert!(original_request(&[]).is_none());
     }
 
     #[test]
