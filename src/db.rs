@@ -287,6 +287,16 @@ impl Db {
     /// inserts messages mid-turn, so append-only saves drift from the
     /// engine's actual state.
     pub fn replace_messages(&self, session_id: &str, messages: &[Message]) -> Result<()> {
+        self.save_snapshot(session_id, messages, None)
+    }
+
+    /// Save history and its credential-free model binding atomically.
+    pub fn save_snapshot(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        binding: Option<&ModelBinding>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -301,12 +311,19 @@ impl Db {
                 stmt.execute([session_id, &message.role, &content_json])?;
             }
         }
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE sessions SET last_active = CURRENT_TIMESTAMP,
              message_count = ?1
              WHERE id = ?2",
             (messages.len() as i64, session_id),
         )?;
+        anyhow::ensure!(updated == 1, "Session no longer exists: {session_id}");
+        if let Some(binding) = binding {
+            tx.execute(
+                "UPDATE sessions SET model = ?1, model_profile = ?2, model_binding = ?3 WHERE id = ?4",
+                (&binding.model, &binding.profile, serde_json::to_string(binding)?, session_id),
+            )?;
+        }
 
         tx.commit()?;
         drop(conn);
@@ -677,5 +694,38 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(message_count, 0);
+    }
+    #[test]
+    fn snapshot_binding_failure_rolls_back_history_and_allows_retry() {
+        use crate::api::MessageContent;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("sessions.db")).unwrap();
+        db.create_session_with_binding("s", &binding("old"), None, None)
+            .unwrap();
+        db.replace_messages("s", &[Message::user("old history")])
+            .unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_binding BEFORE UPDATE OF model_binding ON sessions BEGIN SELECT RAISE(ABORT, 'injected save failure'); END;"
+        ).unwrap();
+        let messages = vec![Message::user("new history")];
+        assert!(db
+            .save_snapshot("s", &messages, Some(&binding("new")))
+            .is_err());
+        assert!(
+            matches!(&db.get_messages("s").unwrap()[0].content, MessageContent::Text(text) if text == "old history")
+        );
+        assert_eq!(db.get_session("s").unwrap().unwrap().model, "old");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_binding")
+            .unwrap();
+        db.save_snapshot("s", &messages, Some(&binding("new")))
+            .unwrap();
+        assert!(
+            matches!(&db.get_messages("s").unwrap()[0].content, MessageContent::Text(text) if text == "new history")
+        );
+        assert_eq!(db.get_session("s").unwrap().unwrap().model, "new");
+        assert!(db.save_snapshot("missing", &[], None).is_err());
     }
 }

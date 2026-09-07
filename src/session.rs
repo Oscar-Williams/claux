@@ -34,6 +34,34 @@ fn prepare_storage_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Last-resort export when shutdown cannot persist to SQLite. Exclusive
+/// creation avoids overwriting files or following pre-existing symlinks.
+pub(crate) fn write_recovery(
+    session_id: &str,
+    messages: &[Message],
+    binding: Option<&ModelBinding>,
+) -> Result<PathBuf> {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!("claux-recovery-{}.json", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({
+            "session_id": session_id, "messages": messages, "model_binding": binding
+        }),
+    )?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(path)
+}
+
 /// Get the database instance (lazy initialization).
 fn get_db() -> Result<Db> {
     let path = db_path()?;
@@ -276,6 +304,26 @@ pub fn repair_history(messages: Vec<Message>) -> Vec<Message> {
 mod tests {
     use super::*;
     use crate::api::types::{ContentBlock, MessageContent};
+
+    #[test]
+    fn recovery_export_preserves_messages_in_a_private_unique_file() {
+        let messages = vec![Message::user("recover me 界")];
+        let path = write_recovery("test-session", &messages, None).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["session_id"], "test-session");
+        assert_eq!(value["messages"][0]["content"], "recover me 界");
+        assert!(value["model_binding"].is_null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

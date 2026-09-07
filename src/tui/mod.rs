@@ -43,6 +43,7 @@ pub async fn run(
     let db = Db::open(&db_path)?;
 
     let shutdown = crate::shutdown::TuiShutdown::listen()?;
+    let tui_logs = crate::logging::TuiLogs::defer();
     let mut terminal_guard = TerminalGuard::enter()?;
 
     let theme = Theme::dark();
@@ -197,12 +198,18 @@ pub async fn run(
     };
 
     let restore_result = terminal_guard.restore();
+    // Drop the guard before flushing diagnostics, including on restore errors.
+    drop(terminal_guard);
+    drop(tui_logs);
 
-    if forced_shutdown {
+    if forced_shutdown || app_result.is_err() {
         if let (Some(session_id), Some(engine)) = (&active_session, &engine) {
             let messages = crate::session::repair_history(engine.messages().to_vec());
-            if let Err(error) = db.replace_messages(session_id, &messages) {
-                tracing::warn!("Failed to save interrupted session: {error}");
+            if let Err(error) = db.save_snapshot(session_id, &messages, engine.model_binding()) {
+                match crate::session::write_recovery(session_id, &messages, engine.model_binding()) {
+                    Ok(path) => eprintln!("Session save failed: {error}. Recovery JSON saved to {}. Copy it somewhere permanent; temporary files may be cleaned up.", path.display()),
+                    Err(recovery_error) => eprintln!("Session save failed: {error}. Recovery export also failed: {recovery_error}. Unsaved messages could not be preserved."),
+                }
             }
         }
     }
