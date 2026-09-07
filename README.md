@@ -16,6 +16,10 @@ A terminal-based AI coding assistant written in Rust. Streams responses, execute
 - **Model selection** — search configured models by provider, profile, or model when starting a TUI session; `/model <profile>` safely switches providers while preserving the chat
 - **Sub-agents** — Agent tool spawns scoped sub-conversations. Sub-agents inherit the parent session's permission mode, so a sub-agent can't act with more authority than you granted the session. Because sub-agents run non-interactively, any tool the mode would prompt for is denied rather than auto-run (Plan denies all writes; Bypass allows all)
 - **Auto-compact** — triggers when conversation gets large
+- **Task-preserving compaction** — summarizes the intact history into an objective,
+  constraints, decisions, progress, and remaining work while retaining the original
+  request verbatim. Later corrections take precedence. Compaction uses a model
+  request; failed, empty, or non-shrinking summaries leave history unchanged.
 - **Cost tracking** — per-model token usage and USD estimates
 - **Prompt caching** — automatic Anthropic cache breakpoints on the system prompt and conversation, cutting input cost and latency on long sessions
 - **Context assembly** — git status, CLAUDE.md, environment info in system prompt. Checked-in CLAUDE.md is loaded only for trusted projects (the user's `~/.claude/CLAUDE.md` always is), and each file is size-capped

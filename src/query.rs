@@ -720,10 +720,8 @@ impl Engine {
         }
     }
 
-    /// Compact the conversation using the multi-strategy pipeline.
-    /// Strategies (in order of aggressiveness):
-    /// 1. Snip — collapse old messages, keep recent ones
-    /// 2. Summarize — send conversation to API for full summary
+    /// Compact into the original request and a task handoff. The summarizer
+    /// sees the intact history before any messages are discarded.
     pub async fn compact(&mut self) -> Result<String> {
         self.compact_with_cancel(
             &tokio_util::sync::CancellationToken::new(),
@@ -743,49 +741,7 @@ impl Engine {
         }
 
         let before_context = self.estimated_context_tokens();
-        let old_count = self.messages.len();
-        let old_tokens = compact::estimate_tokens(&self.messages);
-        let mut summary_source = None;
-
-        // Try snip first (cheaper, no API call)
-        if let Some(snipped) = compact::snip_old_messages(&self.messages, 10) {
-            let new_tokens = compact::estimate_tokens(&snipped);
-            tracing::info!(
-                "Snip compaction: {} msgs → {}, ~{} → ~{} tokens",
-                old_count,
-                snipped.len(),
-                old_tokens,
-                new_tokens
-            );
-
-            // If snip freed enough, we're done
-            if new_tokens < old_tokens && new_tokens < self.context_window * 70 / 100 {
-                let new_count = snipped.len();
-                self.commit_compacted_messages(snipped);
-                let after_context = self.estimated_context_tokens();
-                self.last_compaction_notice = Some(format_compaction_notice(
-                    "snip",
-                    before_context,
-                    after_context,
-                    self.context_window,
-                    old_count,
-                    new_count,
-                ));
-                return Ok(format!(
-                    "{}\nSnipped {} old messages (~{} message tokens freed)",
-                    self.last_compaction_notice.as_deref().unwrap_or_default(),
-                    old_count - new_count + 1, // +1 for snip marker
-                    old_tokens - new_tokens
-                ));
-            }
-
-            summary_source = Some(snipped);
-        }
-
-        // Full summarization. Keep the current history untouched until the
-        // provider completes so a failed compact cannot discard context.
-        let summary_source = summary_source.unwrap_or_else(|| self.messages.clone());
-        self.summarize_conversation(summary_source, before_context, cancel, continuation)
+        self.summarize_conversation(self.messages.clone(), before_context, cancel, continuation)
             .await
     }
 
@@ -797,11 +753,11 @@ impl Engine {
         cancel: &tokio_util::sync::CancellationToken,
         continuation: Continuation,
     ) -> Result<String> {
-        let summary_prompt = "Summarize the conversation so far in a concise paragraph. \
-            Focus on what was discussed, what decisions were made, what files were modified, \
-            and any outstanding tasks. Be specific about file paths and changes.";
+        let summary_prompt = compact::SUMMARY_PROMPT;
 
         let old_count = messages.len();
+        let old_message_tokens = compact::estimate_tokens(&messages);
+        let original_request = compact::original_request(&messages);
         let mut summary_messages = messages;
         summary_messages.push(Message::user(summary_prompt));
 
@@ -844,9 +800,22 @@ impl Engine {
             }
             anyhow::bail!("Compact error: API stream ended without completion");
         }
+        if cancel.is_cancelled() {
+            self.provider.reset_session();
+            anyhow::bail!("Compaction cancelled by user");
+        }
+        if summary.trim().is_empty() {
+            // A completed request may already have advanced a provider cursor,
+            // even though its unusable summary will not enter our history.
+            self.provider.reset_session();
+            anyhow::bail!(
+                "Compact error: provider returned an empty task handoff; history preserved"
+            );
+        }
 
         let mut compacted = vec![
-            Message::user("Here is a summary of our conversation so far:"),
+            original_request
+                .unwrap_or_else(|| Message::user("Here is a summary of our conversation so far:")),
             Message::assistant_text(&summary),
         ];
         if continuation == Continuation::ResumeTask {
@@ -860,6 +829,10 @@ impl Engine {
             compacted.push(Message::user(
                 "Continue with the outstanding task described above.",
             ));
+        }
+        if compact::estimate_tokens(&compacted) >= old_message_tokens {
+            self.provider.reset_session();
+            anyhow::bail!("Compact error: task handoff did not reduce context; history preserved");
         }
         self.commit_compacted_messages(compacted);
         let after_context = self.estimated_context_tokens();
@@ -2194,6 +2167,38 @@ mod tests {
         complete: bool,
     }
 
+    struct RecordingSummaryProvider {
+        resets: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        summary: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingSummaryProvider {
+        fn name(&self) -> &str {
+            "recording-summary"
+        }
+        fn set_model(&mut self, _model: &str) {}
+        fn reset_session(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn stream(
+            &self,
+            messages: &[Message],
+            _system: &str,
+            tools: &[ToolDefinition],
+            _max_tokens: u32,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<ProviderStream> {
+            assert!(tools.is_empty(), "summarization must not execute tools");
+            self.requests.lock().unwrap().push(messages.to_vec());
+            let (tx, rx) = mpsc::channel(2);
+            tx.send(ApiEvent::Text(self.summary.clone())).await.unwrap();
+            tx.send(ApiEvent::Done).await.unwrap();
+            Ok(ProviderStream::new(rx, cancel.child_token()))
+        }
+    }
+
     struct WithinTurnCompactionProvider {
         calls: Arc<AtomicUsize>,
     }
@@ -2218,6 +2223,12 @@ mod tests {
             let (tx, rx) = mpsc::channel(4);
             match call {
                 0 => {
+                    tx.send(ApiEvent::Reasoning {
+                        text: Some("investigating the host configuration ".repeat(200)),
+                        details: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
                     tx.send(ApiEvent::Usage(crate::api::types::Usage {
                         input_tokens: 110_000,
                         ..Default::default()
@@ -2808,7 +2819,7 @@ mod tests {
         assert!(engine.messages().iter().any(|message| {
             matches!(
                 &message.content,
-                MessageContent::Text(text) if text == "Here is a summary of our conversation so far:"
+                MessageContent::Text(text) if text == "repair the host"
             )
         }));
     }
@@ -3754,10 +3765,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snip_compaction_resets_provider_cursor_after_rewriting_history() {
+    async fn old_tool_rounds_are_summarized_before_history_is_replaced() {
         let resets = Arc::new(AtomicUsize::new(0));
-        let provider = Box::new(ResetTrackingProvider {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(RecordingSummaryProvider {
             resets: resets.clone(),
+            requests: requests.clone(),
+            summary: "Objective: finish the original task. Progress: README.md was read.".into(),
         });
         let mut engine =
             Engine::for_tests(provider, SteeringQueue::default(), PermissionMode::Bypass);
@@ -3783,14 +3797,17 @@ mod tests {
                 .push(Message::user(&format!("recent message {index}")));
         }
 
+        let original = serde_json::to_value(engine.messages()).unwrap();
         let result = engine.compact().await.unwrap();
 
+        assert_eq!(engine.messages().len(), 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(serde_json::to_value(&requests[0][..13]).unwrap(), original);
         assert_eq!(
-            engine.messages().len(),
-            12,
-            "tool-result boundary backoff reproduces the stale cursor index shape"
+            serde_json::to_value(&engine.messages()[0]).unwrap(),
+            original[0]
         );
-        assert!(result.contains("Compacted via snip:"));
+        assert!(result.contains("Compacted via summary:"));
         assert!(result.contains("tokens"));
         assert_eq!(resets.load(Ordering::SeqCst), 1);
     }
@@ -3818,6 +3835,94 @@ mod tests {
         assert_eq!(engine.messages().len(), 2);
         assert!(!has_consecutive_user_messages(engine.messages()));
         assert_eq!(resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_and_resume_retain_request_and_task_handoff() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let summary = "Objective: fix parsing. Constraints: keep the API; use branches only. \
+            Decisions: preserve UTF-8. Progress: src/parser.rs updated; tests pass. \
+            Outstanding work: add malformed-input coverage.";
+        let mut engine = Engine::for_tests(
+            Box::new(RecordingSummaryProvider {
+                resets,
+                requests: requests.clone(),
+                summary: summary.into(),
+            }),
+            SteeringQueue::default(),
+            PermissionMode::Bypass,
+        );
+        let request = Message::user("Fix parsing; preserve the public API. Work in a worktree.");
+        engine.messages_mut().extend([
+            request.clone(),
+            Message::assistant_text("I will inspect the parser."),
+            Message::user("Correction: use branches only, no worktrees."),
+            Message::assistant_text(&"parser investigation and logs ".repeat(1_000)),
+        ]);
+        engine.compact().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&engine.messages()[0]).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
+        assert!(
+            matches!(&engine.messages()[1].content, MessageContent::Text(text) if text == summary)
+        );
+
+        // Exercise the same serialization and repair path used by session resume.
+        let saved = serde_json::to_string(engine.messages()).unwrap();
+        let restored = crate::session::repair_history(serde_json::from_str(&saved).unwrap());
+        engine.set_messages(restored);
+        engine.messages_mut().extend([
+            Message::user("Continue with malformed-input coverage."),
+            Message::assistant_text(&"more investigation and logs ".repeat(1_000)),
+        ]);
+        engine.compact().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&engine.messages()[0]).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(&requests[0][2].content, MessageContent::Text(text) if text.contains("no worktrees"))
+        );
+        assert!(matches!(&requests[1][1].content, MessageContent::Text(text) if text == summary));
+        assert!(
+            matches!(&requests[1].last().unwrap().content, MessageContent::Text(text) if text.contains("Later user instructions supersede earlier"))
+        );
+        assert!(!has_consecutive_user_messages(engine.messages()));
+    }
+
+    #[tokio::test]
+    async fn empty_or_oversized_summary_preserves_history_and_resets_cursor() {
+        for summary in [" ".to_string(), "irrelevant expansion ".repeat(1_000)] {
+            let resets = Arc::new(AtomicUsize::new(0));
+            let mut engine = Engine::for_tests(
+                Box::new(RecordingSummaryProvider {
+                    resets: resets.clone(),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    summary,
+                }),
+                SteeringQueue::default(),
+                PermissionMode::Bypass,
+            );
+            engine.messages_mut().extend([
+                Message::user("Fix parsing; keep the public API."),
+                Message::assistant_text(
+                    "Investigated src/parser.rs; next add regression coverage.",
+                ),
+            ]);
+            let original = serde_json::to_value(engine.messages()).unwrap();
+            let error = engine.compact().await.unwrap_err();
+            assert!(error.to_string().contains("history preserved"));
+            assert_eq!(serde_json::to_value(engine.messages()).unwrap(), original);
+            assert_eq!(
+                resets.load(Ordering::SeqCst),
+                1,
+                "a completed but rejected summary must not leave a continuation cursor"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3849,7 +3954,7 @@ mod tests {
         let messages = engine.messages();
         assert!(matches!(
             &messages[0].content,
-            MessageContent::Text(text) if text == "Here is a summary of our conversation so far:"
+            MessageContent::Text(text) if text == &format!("0: {large_message}")
         ));
         assert!(
             !has_consecutive_user_messages(messages),
@@ -3894,7 +3999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snip_candidate_that_increases_tokens_is_not_committed() {
+    async fn short_messages_are_summarized_without_snipping() {
         let resets = Arc::new(AtomicUsize::new(0));
         let provider = Box::new(CompactionTrackingProvider {
             resets: resets.clone(),
@@ -3913,13 +4018,13 @@ mod tests {
         assert_eq!(
             engine.messages().len(),
             2,
-            "a larger snip candidate should fall back to summary compaction"
+            "compaction retains the original request and a summary"
         );
         assert_eq!(resets.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn failed_summary_preserves_history_after_snipping_candidate() {
+    async fn failed_summary_preserves_entire_history() {
         let resets = Arc::new(AtomicUsize::new(0));
         let provider = Box::new(CompactionTrackingProvider {
             resets: resets.clone(),
@@ -3941,7 +4046,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(engine.messages()).unwrap(),
             original,
-            "failed summarization must not commit the snipped candidate"
+            "failed summarization must not discard any history"
         );
         assert_eq!(
             resets.load(Ordering::SeqCst),
