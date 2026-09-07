@@ -371,7 +371,7 @@ impl ChatApp {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = normalize_paste(text);
         super::input::insert_text(&mut self.input, &mut self.cursor, &normalized);
     }
 
@@ -872,12 +872,17 @@ async fn prompt_permission_tui<B: ratatui::backend::Backend>(
     let mut perm_input = String::new();
 
     let response = loop {
-        match keys.poll_key()? {
+        match keys.poll_event()? {
             None => {
                 // Nothing typed: yield to the runtime before polling again
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            Some(key) => {
+            Some(Event::Paste(text)) => {
+                perm_input.push_str(&normalize_paste(&text));
+                app.status = format!("{} | deny and message: {perm_input}", app.model);
+                terminal.draw(|f| ui::draw_chat(f, app))?;
+            }
+            Some(Event::Key(key)) if key.kind != event::KeyEventKind::Release => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter if perm_input.is_empty() => {
                         break PermissionResponse::Allow;
@@ -913,6 +918,7 @@ async fn prompt_permission_tui<B: ratatui::backend::Backend>(
                 app.status = format!("{} | deny and message: {perm_input}", app.model);
                 terminal.draw(|f| ui::draw_chat(f, app))?;
             }
+            Some(_) => {}
         }
     };
 
@@ -929,18 +935,16 @@ async fn prompt_permission_tui<B: ratatui::backend::Backend>(
 /// makes the interactive flow (steering, permission prompts, Ctrl+C)
 /// coverable by `cargo test`.
 pub trait KeySource {
-    fn poll_key(&mut self) -> Result<Option<KeyEvent>>;
+    fn poll_event(&mut self) -> Result<Option<Event>>;
 }
 
 /// Reads keys from the real terminal without blocking.
 pub struct CrosstermKeys;
 
 impl KeySource for CrosstermKeys {
-    fn poll_key(&mut self) -> Result<Option<KeyEvent>> {
+    fn poll_event(&mut self) -> Result<Option<Event>> {
         if event::poll(std::time::Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                return Ok(Some(key));
-            }
+            return Ok(Some(event::read()?));
         }
         Ok(None)
     }
@@ -956,7 +960,17 @@ fn poll_stream_key(
     steering: &SteeringQueue,
 ) -> Result<bool> {
     {
-        if let Some(key) = keys.poll_key()? {
+        let input = keys.poll_event()?;
+        if let Some(Event::Paste(text)) = &input {
+            steer_buf
+                .lock()
+                .expect("steer buffer poisoned")
+                .push_str(&normalize_paste(text));
+        }
+        if let Some(Event::Key(key)) = input {
+            if key.kind == event::KeyEventKind::Release {
+                return Ok(false);
+            }
             match (key.modifiers, key.code) {
                 (KeyModifiers::CONTROL, KeyCode::Char('c')) => return Ok(true),
                 (_, KeyCode::Enter) => {
@@ -983,6 +997,10 @@ fn poll_stream_key(
         }
     }
     Ok(false)
+}
+
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn format_permission_details(tool_name: &str, input: &serde_json::Value) -> Vec<String> {
@@ -1430,9 +1448,89 @@ mod turn_tests {
 
     struct ScriptedKeys(std::collections::VecDeque<KeyEvent>);
 
-    impl KeySource for ScriptedKeys {
-        fn poll_key(&mut self) -> Result<Option<KeyEvent>> {
+    struct ScriptedEvents(std::collections::VecDeque<Event>);
+
+    impl KeySource for ScriptedEvents {
+        fn poll_event(&mut self) -> Result<Option<Event>> {
             Ok(self.0.pop_front())
+        }
+    }
+
+    #[test]
+    fn streaming_paste_preserves_multiline_unicode_until_explicit_enter() {
+        let buffer = Arc::new(Mutex::new(String::from("prefix ")));
+        let steering = SteeringQueue::default();
+        let mut keys = ScriptedEvents(
+            vec![
+                Event::Paste("界\r\nsecond\rthird\n".into()),
+                Event::Key(enter()),
+            ]
+            .into(),
+        );
+        assert!(!poll_stream_key(&mut keys, &buffer, &steering).unwrap());
+        assert_eq!(*buffer.lock().unwrap(), "prefix 界\nsecond\nthird\n");
+        assert!(steering.lock().unwrap().is_empty());
+        assert!(!poll_stream_key(&mut keys, &buffer, &steering).unwrap());
+        assert_eq!(
+            steering.lock().unwrap().pop_front().unwrap(),
+            "prefix 界\nsecond\nthird"
+        );
+        assert!(buffer.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_paste_cannot_grant_approval_or_submit_embedded_newlines() {
+        for pasted in ["y\n", "a\r\n", "n\n", "please inspect 界\nfirst"] {
+            let mut app = ChatApp::new("test", Theme::dark());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let mut keys =
+                ScriptedEvents(vec![Event::Paste(pasted.into()), Event::Key(enter())].into());
+            let steering = SteeringQueue::default();
+            let response = prompt_permission_tui(
+                &mut app,
+                &mut terminal,
+                &mut keys,
+                "Bash",
+                "echo test",
+                &serde_json::json!({"command": "echo test"}),
+                &steering,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response, PermissionResponse::DenyAndCancel);
+            assert_eq!(
+                steering.lock().unwrap().pop_front().unwrap(),
+                normalize_paste(pasted)
+            );
+            assert!(keys.0.is_empty(), "only the physical Enter submits");
+        }
+    }
+
+    #[test]
+    fn streaming_ignores_key_release_and_keeps_ctrl_c_after_paste() {
+        let buffer = Arc::new(Mutex::new(String::new()));
+        let steering = SteeringQueue::default();
+        let mut keys = ScriptedEvents(
+            vec![
+                Event::Paste("draft".into()),
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    event::KeyEventKind::Release,
+                )),
+                Event::Key(ctrl_c()),
+            ]
+            .into(),
+        );
+        assert!(!poll_stream_key(&mut keys, &buffer, &steering).unwrap());
+        assert!(!poll_stream_key(&mut keys, &buffer, &steering).unwrap());
+        assert!(steering.lock().unwrap().is_empty());
+        assert!(poll_stream_key(&mut keys, &buffer, &steering).unwrap());
+    }
+
+    impl KeySource for ScriptedKeys {
+        fn poll_event(&mut self) -> Result<Option<Event>> {
+            Ok(self.0.pop_front().map(Event::Key))
         }
     }
 
