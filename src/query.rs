@@ -224,6 +224,7 @@ pub enum StreamEvent {
     },
     ToolResult {
         is_error: bool,
+        content: String,
     },
     /// Live execution updates, indexed within the announced tool batch.
     /// ToolResult remains ordered for transcript consumers.
@@ -233,6 +234,11 @@ pub enum StreamEvent {
     ToolFinished {
         index: usize,
         is_error: bool,
+        content: String,
+    },
+    ToolOutput {
+        index: usize,
+        content: String,
     },
     /// Permission prompt — UI must respond via the oneshot sender.
     /// `input` is the raw tool input so UIs can render rich details.
@@ -462,6 +468,7 @@ impl Engine {
         name: &str,
         input: serde_json::Value,
         cancel: &tokio_util::sync::CancellationToken,
+        progress: tokio::sync::watch::Sender<String>,
     ) -> crate::tools::ToolOutput {
         let token = cancel.child_token();
         let steering = self.steering.clone();
@@ -476,7 +483,10 @@ impl Engine {
             }
         });
 
-        let output = self.tools.execute(name, input, token).await;
+        let output = self
+            .tools
+            .execute_with_progress(name, input, token, Some(progress))
+            .await;
         watcher.abort();
         output
     }
@@ -1457,7 +1467,12 @@ impl Engine {
                     let mut result_blocks = Vec::with_capacity(tool_uses.len());
                     for (id, name, input) in &tool_uses {
                         self.fire_hook(&HookTrigger::OnToolComplete).await;
-                        let _ = tx.send(StreamEvent::ToolResult { is_error: true }).await;
+                        let _ = tx
+                            .send(StreamEvent::ToolResult {
+                                is_error: true,
+                                content: Self::INTERRUPTED_BY_USER.to_string(),
+                            })
+                            .await;
                         self.tool_trace.push(ToolTraceEntry {
                             id: id.clone(),
                             name: name.clone(),
@@ -1693,6 +1708,7 @@ impl Engine {
             let _ = tx
                 .send(StreamEvent::ToolResult {
                     is_error: output.is_error,
+                    content: output.content.clone(),
                 })
                 .await;
 
@@ -1775,13 +1791,27 @@ impl Engine {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> crate::tools::ToolOutput {
         let _ = tx.send(StreamEvent::ToolRunning { index }).await;
-        let output = self
-            .execute_tool_steerable(name, input.clone(), cancel)
-            .await;
+        let (progress, mut updates) = tokio::sync::watch::channel(String::new());
+        let execution = self.execute_tool_steerable(name, input.clone(), cancel, progress);
+        tokio::pin!(execution);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        let output = loop {
+            tokio::select! {
+                output = &mut execution => break output,
+                _ = tick.tick() => {
+                    if updates.has_changed().unwrap_or(false) {
+                        let content = updates.borrow_and_update().clone();
+                        // Previews are replaceable, never backpressure execution.
+                        let _ = tx.try_send(StreamEvent::ToolOutput { index, content });
+                    }
+                }
+            }
+        };
         let _ = tx
             .send(StreamEvent::ToolFinished {
                 index,
                 is_error: output.is_error,
+                content: output.content.clone(),
             })
             .await;
         output
@@ -4334,8 +4364,15 @@ mod tests {
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::ToolRunning { index } => running.push(index),
-                    StreamEvent::ToolFinished { index, is_error } => {
+                    StreamEvent::ToolFinished {
+                        index,
+                        is_error,
+                        content,
+                    } => {
                         assert!(!is_error);
+                        if index == 1 {
+                            assert!(content.contains("approved"));
+                        }
                         finished.push(index);
                     }
                     StreamEvent::PermissionRequest { respond, .. } => {

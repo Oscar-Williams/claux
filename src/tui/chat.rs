@@ -29,6 +29,7 @@ pub enum ChatMessage {
         summary: String,
         detail: Option<String>,
         status: ToolStatus,
+        output: String,
     },
 }
 
@@ -57,6 +58,7 @@ pub struct Activity {
 
 /// Chat screen state.
 pub struct ChatApp {
+    pub expand_tool_output: bool,
     pub activity: Option<Activity>,
     pub messages: Vec<ChatMessage>,
     pub input: String,
@@ -98,6 +100,7 @@ pub struct ChatApp {
 impl ChatApp {
     pub fn new(model: &str, theme: Theme) -> Self {
         Self {
+            expand_tool_output: false,
             activity: None,
             messages: Vec::new(),
             input: String::new(),
@@ -216,6 +219,7 @@ impl ChatApp {
             summary: crate::utils::sanitize_terminal_text(summary),
             detail: detail.map(crate::utils::sanitize_terminal_text),
             status,
+            output: String::new(),
         });
     }
 
@@ -234,6 +238,17 @@ impl ChatApp {
         self.messages_rev += 1;
         if let Some(ChatMessage::Tool { status, .. }) = self.messages.get_mut(idx) {
             *status = new_status;
+        }
+    }
+
+    pub fn set_tool_output_at(&mut self, idx: usize, content: &str) {
+        if let Some(ChatMessage::Tool { output, .. }) = self.messages.get_mut(idx) {
+            let bounded = crate::utils::tail_str(content, 20_000);
+            *output = crate::utils::sanitize_terminal_text(bounded);
+            if bounded.len() < content.len() {
+                output.insert_str(0, "[earlier output omitted]\n");
+            }
+            self.messages_rev += 1;
         }
     }
 
@@ -260,6 +275,11 @@ impl ChatApp {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) {
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+            self.expand_tool_output = !self.expand_tool_output;
+            self.messages_rev += 1;
+            return;
+        }
         // Any key other than Ctrl+C stands down a pending exit confirmation.
         let is_ctrl_c = key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c');
         if !is_ctrl_c && self.ctrl_c.is_armed() {
@@ -731,14 +751,22 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                             }
                             app.refresh_tool_activity(&batch_tools);
                         }
-                        StreamEvent::ToolFinished { index, is_error } => {
+                        StreamEvent::ToolOutput { index, content } => {
                             if let Some(&idx) = batch_tools.get(index) {
+                                app.set_tool_output_at(idx, &content);
+                                app.refresh_tool_activity(&batch_tools);
+                            }
+                        }
+                        StreamEvent::ToolFinished { index, is_error, content } => {
+                            if let Some(&idx) = batch_tools.get(index) {
+                                app.set_tool_output_at(idx, &content);
                                 app.set_tool_status_at(idx, if is_error { ToolStatus::Error } else { ToolStatus::Success });
                             }
                             app.refresh_tool_activity(&batch_tools);
                         }
-                        StreamEvent::ToolResult { is_error, .. } => {
+                        StreamEvent::ToolResult { is_error, content } => {
                             if let Some(idx) = running_tools.pop_front() {
+                                app.set_tool_output_at(idx, &content);
                                 app.set_tool_status_at(
                                     idx,
                                     if is_error { ToolStatus::Error } else { ToolStatus::Success },
@@ -1060,6 +1088,26 @@ mod tests {
         for c in text.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn output_is_bounded_sanitized_and_expandable_without_changing_input() {
+        let mut app = test_app();
+        app.add_tool("Bash", "echo", ToolStatus::Running);
+        app.set_tool_output_at(0, &format!("{}\x1b[31mfinal\x07", "界".repeat(20_000)));
+        let ChatMessage::Tool { output, .. } = &app.messages[0] else {
+            panic!()
+        };
+        assert!(output.len() < 20_100);
+        assert!(output.starts_with("[earlier output omitted]"));
+        assert!(output.ends_with("final"));
+        assert!(!output.contains('\x1b'));
+        app.input = "draft".into();
+        let revision = app.messages_rev;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(app.expand_tool_output);
+        assert!(app.messages_rev > revision);
+        assert_eq!(app.input, "draft");
     }
 
     #[test]
@@ -1846,6 +1894,12 @@ mod tuishot_shots {
         ToolQueued,
 
         #[tuishot(
+            name = "chat-tool-output",
+            description = "Live bounded Bash output preview"
+        )]
+        ToolOutput,
+
+        #[tuishot(
             name = "chat-permission",
             description = "Prompting for Bash permission"
         )]
@@ -1883,10 +1937,10 @@ mod tuishot_shots {
                     ]);
                     app
                 }
-                ChatShot::ToolRunning | ChatShot::ToolQueued => {
+                ChatShot::ToolRunning | ChatShot::ToolQueued | ChatShot::ToolOutput => {
                     let mut app = sample_conversation();
                     app.mode = Mode::Streaming;
-                    let running = matches!(self, ChatShot::ToolRunning);
+                    let running = !matches!(self, ChatShot::ToolQueued);
                     app.add_tool_with_input(
                         "Bash",
                         "",
@@ -1911,6 +1965,11 @@ mod tuishot_shots {
                         started,
                         updated: started,
                     });
+                    if matches!(self, ChatShot::ToolOutput) {
+                        app.set_tool_output_at(app.messages.len() - 1,
+                            "[stdout]\nScanning repositories...\ncloud-hosting/README.md:12:Deployment\nclaux/config.toml:8:cloud-hosting\nStill scanning worktrees...");
+                        app.activity.as_mut().unwrap().updated = now;
+                    }
                     app
                 }
                 ChatShot::Empty => {
