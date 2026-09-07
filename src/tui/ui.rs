@@ -323,6 +323,7 @@ fn history_lines(app: &ChatApp) -> Vec<Line<'static>> {
                 summary,
                 detail,
                 status,
+                output,
             } => {
                 let (indicator, indicator_color) = match status {
                     ToolStatus::Queued => ("◷", app.theme.dim),
@@ -348,6 +349,28 @@ fn history_lines(app: &ChatApp) -> Vec<Line<'static>> {
                         Span::styled("  └─ ", Style::default().fg(app.theme.dim)),
                         Span::styled(detail.clone(), Style::default().fg(app.theme.dim)),
                     ]));
+                }
+                if !output.is_empty() {
+                    let preview: Vec<_> = output.lines().collect();
+                    let start = if app.expand_tool_output {
+                        0
+                    } else {
+                        preview.len().saturating_sub(3)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        if app.expand_tool_output {
+                            "  output (Ctrl+O to collapse)"
+                        } else {
+                            "  output preview (Ctrl+O to expand when idle)"
+                        },
+                        Style::default().fg(app.theme.dim),
+                    )));
+                    for line in &preview[start..] {
+                        lines.push(Line::from(Span::styled(
+                            format!("  │ {line}"),
+                            Style::default().fg(app.theme.fg),
+                        )));
+                    }
                 }
             }
         }

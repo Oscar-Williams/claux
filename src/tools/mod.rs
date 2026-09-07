@@ -62,6 +62,15 @@ pub trait Tool: Send + Sync {
     /// long-running tools should monitor it and clean up. Tools without a
     /// natural interrupt point can ignore it.
     async fn execute(&self, input: Value, cancel: CancellationToken) -> Result<ToolOutput>;
+
+    async fn execute_with_progress(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+        _progress: Option<tokio::sync::watch::Sender<String>>,
+    ) -> Result<ToolOutput> {
+        self.execute(input, cancel).await
+    }
 }
 
 /// Registry holding all available tools.
@@ -172,7 +181,18 @@ impl ToolRegistry {
     /// can see and recover from. Propagating an Err here would abort the
     /// whole turn and leave a dangling tool_use in history, which the API
     /// rejects on the next request.
+    #[cfg(test)]
     pub async fn execute(&self, name: &str, input: Value, cancel: CancellationToken) -> ToolOutput {
+        self.execute_with_progress(name, input, cancel, None).await
+    }
+
+    pub async fn execute_with_progress(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+        progress: Option<tokio::sync::watch::Sender<String>>,
+    ) -> ToolOutput {
         let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
             let available: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
             return ToolOutput {
@@ -184,7 +204,7 @@ impl ToolRegistry {
             };
         };
 
-        match tool.execute(input, cancel).await {
+        match tool.execute_with_progress(input, cancel, progress).await {
             Ok(output) => output,
             Err(e) => ToolOutput {
                 content: format!("Tool {name} failed: {e}"),

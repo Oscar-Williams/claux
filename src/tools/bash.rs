@@ -54,12 +54,15 @@ impl Capture {
 
 fn capture_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut pipe: Option<R>,
+    stream: &'static str,
+    progress: Option<tokio::sync::watch::Sender<String>>,
 ) -> (JoinHandle<()>, Arc<Mutex<Capture>>) {
     let capture = Arc::new(Mutex::new(Capture::default()));
     let reader_capture = capture.clone();
     let task = tokio::spawn(async move {
         if let Some(pipe) = pipe.as_mut() {
             let mut chunk = [0; 8192];
+            let mut tail = Vec::new();
             while let Ok(count) = pipe.read(&mut chunk).await {
                 if count == 0 {
                     break;
@@ -68,6 +71,14 @@ fn capture_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                     .lock()
                     .expect("capture poisoned")
                     .append(&chunk[..count]);
+                if let Some(progress) = &progress {
+                    tail.extend_from_slice(&chunk[..count]);
+                    if tail.len() > 4096 {
+                        tail.drain(..tail.len() - 4096);
+                    }
+                    progress
+                        .send_replace(format!("[{stream}]\n{}", String::from_utf8_lossy(&tail)));
+                }
             }
         }
     });
@@ -140,6 +151,15 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, input: Value, cancel: CancellationToken) -> Result<ToolOutput> {
+        self.execute_with_progress(input, cancel, None).await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+        progress: Option<tokio::sync::watch::Sender<String>>,
+    ) -> Result<ToolOutput> {
         let params: Params = serde_json::from_value(input)?;
 
         let timeout_ms = params.timeout.unwrap_or(120_000).min(600_000);
@@ -169,8 +189,9 @@ impl Tool for BashTool {
         let process_group = child.id();
 
         // Take the pipes so we can read them concurrently with wait().
-        let (mut stdout_task, stdout) = capture_pipe(child.stdout().take());
-        let (mut stderr_task, stderr) = capture_pipe(child.stderr().take());
+        let (mut stdout_task, stdout) =
+            capture_pipe(child.stdout().take(), "stdout", progress.clone());
+        let (mut stderr_task, stderr) = capture_pipe(child.stderr().take(), "stderr", progress);
 
         let outcome = tokio::select! {
             status = wait_for_parent(&mut child) => Outcome::Finished(status),
@@ -327,6 +348,37 @@ mod tests {
         CancellationToken::new()
     }
 
+    #[tokio::test]
+    async fn live_output_is_bounded_and_arrives_before_completion() {
+        let (tx, mut rx) = tokio::sync::watch::channel(String::new());
+        let cancel = token();
+        let tool = tool();
+        let execution = tool.execute_with_progress(
+            json!({
+                "command": "head -c 20000 /dev/zero | tr '\\0' x; printf '\\nready\\n'; sleep 30"
+            }),
+            cancel.clone(),
+            Some(tx),
+        );
+        let observer = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    rx.changed().await.unwrap();
+                    let preview = rx.borrow_and_update().clone();
+                    assert!(preview.len() < 4200);
+                    if preview.contains("ready") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            cancel.cancel();
+        };
+        let (output, ()) = tokio::join!(execution, observer);
+        assert!(output.unwrap().content.contains("Interrupted by user"));
+    }
+
     fn tool() -> BashTool {
         BashTool::new(Arc::new(CommandSandbox::unrestricted_for_tests()))
     }
@@ -362,7 +414,7 @@ mod tests {
     async fn abandoning_reader_preserves_partial_output() {
         use tokio::io::AsyncWriteExt;
         let (mut writer, reader) = tokio::io::duplex(64);
-        let (mut task, capture) = capture_pipe(Some(reader));
+        let (mut task, capture) = capture_pipe(Some(reader), "stdout", None);
         writer.write_all(b"partial").await.unwrap();
         tokio::task::yield_now().await;
         assert!(drain_reader(&mut task).await);
