@@ -324,7 +324,13 @@ async fn read_responses_sse(
                 clear_cursor(&cursor);
                 return Ok(())
             },
-            chunk = stream.next() => chunk,
+            chunk = super::stream::next_with_idle_timeout(stream.next()) => match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    clear_cursor(&cursor);
+                    return Err(error);
+                }
+            },
         };
         let Some(chunk) = chunk else {
             break;

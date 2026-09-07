@@ -82,6 +82,68 @@ impl Utf8LineDecoder {
     }
 }
 
+/// Bound silence between transport chunks, including SSE heartbeat comments.
+pub(super) async fn next_with_idle_timeout<T>(
+    next: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    read_with_idle_timeout(next, std::time::Duration::from_secs(120)).await
+}
+
+async fn read_with_idle_timeout<T>(
+    next: impl std::future::Future<Output = T>,
+    idle: std::time::Duration,
+) -> Result<T> {
+    tokio::time::timeout(idle, next).await.map_err(|_| {
+        super::error::ApiFailure::other(format!(
+            "Provider stream sent no data for {} seconds. The request was stopped; retry the turn or check the provider connection.",
+            idle.as_secs()
+        )).into()
+    })
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_stream_fails_with_an_actionable_error() {
+        let error = next_with_idle_timeout(std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no data for 120 seconds"));
+        assert!(error.to_string().contains("retry the turn"));
+        assert_eq!(
+            super::super::error::classify_reader_error(&error).kind,
+            super::super::error::ApiFailureKind::Other
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_chunk_gets_a_fresh_idle_deadline() {
+        for _ in 0..3 {
+            next_with_idle_timeout(tokio::time::sleep(Duration::from_secs(60)))
+                .await
+                .unwrap();
+        }
+        assert!(next_with_idle_timeout(std::future::pending::<()>())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_does_not_wait_for_the_idle_deadline() {
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        cancel.cancel();
+        tokio::select! {
+            _ = cancel.cancelled() => {},
+            _ = next_with_idle_timeout(std::future::pending::<()>()) => panic!("cancellation lost"),
+        }
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+}
+
 /// Read an SSE response and send parsed events to the channel.
 pub async fn read_sse_stream(
     response: reqwest::Response,
@@ -107,7 +169,7 @@ pub async fn read_sse_stream(
     loop {
         let chunk_result = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            chunk = stream.next() => chunk,
+            chunk = next_with_idle_timeout(stream.next()) => chunk?,
         };
         let Some(chunk_result) = chunk_result else {
             break;
