@@ -6,7 +6,7 @@ use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
@@ -18,6 +18,61 @@ use crate::command_sandbox::CommandSandbox;
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const CAPTURE_LIMIT: usize = 50_000;
+
+#[derive(Default)]
+struct Capture {
+    bytes: Vec<u8>,
+    total: usize,
+}
+
+impl Capture {
+    fn append(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        let keep = bytes.len().min(CAPTURE_LIMIT - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..keep]);
+    }
+
+    fn render(&self, stream: &str) -> String {
+        let truncated = self.total > self.bytes.len();
+        let bytes = match std::str::from_utf8(&self.bytes) {
+            Err(error) if truncated && error.error_len().is_none() => {
+                &self.bytes[..error.valid_up_to()]
+            }
+            _ => &self.bytes,
+        };
+        let mut text = render_output(bytes, stream);
+        if truncated {
+            text.push_str(&format!(
+                "\n... ({stream} truncated; {} bytes omitted)",
+                self.total - bytes.len()
+            ));
+        }
+        text
+    }
+}
+
+fn capture_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    mut pipe: Option<R>,
+) -> (JoinHandle<()>, Arc<Mutex<Capture>>) {
+    let capture = Arc::new(Mutex::new(Capture::default()));
+    let reader_capture = capture.clone();
+    let task = tokio::spawn(async move {
+        if let Some(pipe) = pipe.as_mut() {
+            let mut chunk = [0; 8192];
+            while let Ok(count) = pipe.read(&mut chunk).await {
+                if count == 0 {
+                    break;
+                }
+                reader_capture
+                    .lock()
+                    .expect("capture poisoned")
+                    .append(&chunk[..count]);
+            }
+        }
+    });
+    (task, capture)
+}
 
 pub struct BashTool {
     sandbox: Arc<CommandSandbox>,
@@ -114,25 +169,8 @@ impl Tool for BashTool {
         let process_group = child.id();
 
         // Take the pipes so we can read them concurrently with wait().
-        let mut stdout_pipe = child.stdout().take();
-        let mut stderr_pipe = child.stderr().take();
-
-        // Spawn readers so partial output is captured even if we get cancelled
-        // or time out mid-stream.
-        let mut stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(p) = stdout_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf).await;
-            }
-            buf
-        });
-        let mut stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(p) = stderr_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf).await;
-            }
-            buf
-        });
+        let (mut stdout_task, stdout) = capture_pipe(child.stdout().take());
+        let (mut stderr_task, stderr) = capture_pipe(child.stderr().take());
 
         let outcome = tokio::select! {
             status = wait_for_parent(&mut child) => Outcome::Finished(status),
@@ -151,12 +189,12 @@ impl Tool for BashTool {
             let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, wait_for_parent(&mut child)).await;
         }
 
-        let (stdout, stdout_abandoned) = drain_reader(&mut stdout_task).await;
-        let (stderr, stderr_abandoned) = drain_reader(&mut stderr_task).await;
+        let stdout_abandoned = drain_reader(&mut stdout_task).await;
+        let stderr_abandoned = drain_reader(&mut stderr_task).await;
         let output_abandoned = stdout_abandoned || stderr_abandoned;
 
-        let stdout_s = render_output(&stdout, "stdout");
-        let stderr_s = render_output(&stderr, "stderr");
+        let stdout_s = stdout.lock().expect("capture poisoned").render("stdout");
+        let stderr_s = stderr.lock().expect("capture poisoned").render("stderr");
 
         let mut content = String::new();
         if !stdout_s.is_empty() {
@@ -221,11 +259,6 @@ impl Tool for BashTool {
             is_error = true;
         }
 
-        if content.len() > 100_000 {
-            content.truncate(100_000);
-            content.push_str("\n... (output truncated)");
-        }
-
         Ok(ToolOutput { content, is_error })
     }
 }
@@ -262,13 +295,13 @@ fn terminate_process_tree(
     child.start_kill().is_ok()
 }
 
-async fn drain_reader(task: &mut JoinHandle<Vec<u8>>) -> (Vec<u8>, bool) {
+async fn drain_reader(task: &mut JoinHandle<()>) -> bool {
     match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *task).await {
-        Ok(Ok(output)) => (output, false),
-        Ok(Err(_)) => (Vec::new(), false),
+        Ok(_) => false,
         Err(_) => {
             task.abort();
-            (Vec::new(), true)
+            let _ = task.await;
+            true
         }
     }
 }
@@ -296,6 +329,44 @@ mod tests {
 
     fn tool() -> BashTool {
         BashTool::new(Arc::new(CommandSandbox::unrestricted_for_tests()))
+    }
+
+    #[test]
+    fn capture_is_bounded_and_truncates_unicode_safely() {
+        let mut capture = Capture::default();
+        for _ in 0..100 {
+            capture.append("界".repeat(8192).as_bytes());
+        }
+        assert_eq!(capture.bytes.len(), CAPTURE_LIMIT);
+        assert_eq!(capture.total, 100 * 8192 * 3);
+        let rendered = capture.render("stdout");
+        assert!(rendered.starts_with("界"));
+        assert!(rendered.contains("stdout truncated"));
+        assert!(!rendered.contains("binary"));
+        assert!(!rendered.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn noisy_streams_are_drained_and_keep_failure_diagnostics() {
+        let output = tool().execute(json!({
+            "command": "head -c 200000 /dev/zero | tr '\\0' x; head -c 200000 /dev/zero | tr '\\0' y >&2; exit 7"
+        }), token()).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("stdout truncated"));
+        assert!(output.content.contains("stderr truncated"));
+        assert!(output.content.contains("Exit code:"));
+        assert!(output.content.len() < 101_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoning_reader_preserves_partial_output() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (mut task, capture) = capture_pipe(Some(reader));
+        writer.write_all(b"partial").await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(drain_reader(&mut task).await);
+        assert_eq!(capture.lock().unwrap().render("stdout"), "partial");
     }
 
     #[tokio::test]
@@ -440,11 +511,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn detached_process_cannot_hold_output_capture_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        // Wait until setsid has actually detached before letting the parent
+        // exit and trigger process-group cleanup.
+        let command = format!(
+            "setsid sh -c 'touch \"{}\"; sleep 2' & while [ ! -e \"{}\" ]; do sleep 0.01; done; printf ready",
+            ready.display(), ready.display()
+        );
         let start = std::time::Instant::now();
         let result = tool()
             .execute(
                 json!({
-                    "command": "setsid sh -c 'sleep 2' & printf ready",
+                    "command": command,
                     "timeout": 60000
                 }),
                 token(),
