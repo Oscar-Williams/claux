@@ -5,6 +5,48 @@ use tokio_util::sync::CancellationToken;
 
 const INTERRUPTED_MESSAGE: &str = "Interrupted by shutdown signal.";
 
+/// Own the TUI signal listener so returning to a caller does not leave a
+/// detached task behind. Keyboard Ctrl+C remains a TUI key in raw mode.
+pub struct TuiShutdown {
+    pub token: CancellationToken,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+impl TuiShutdown {
+    pub fn listen() -> Result<Self> {
+        let token = CancellationToken::new();
+        let shutdown = token.clone();
+        #[cfg(unix)]
+        let listener = {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut terminate = signal(SignalKind::terminate())?;
+            let mut hangup = signal(SignalKind::hangup())?;
+            let mut interrupt = signal(SignalKind::interrupt())?;
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = hangup.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
+                shutdown.cancel();
+            })
+        };
+        #[cfg(not(unix))]
+        let listener = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                shutdown.cancel();
+            }
+        });
+        Ok(Self { token, listener })
+    }
+}
+
+impl Drop for TuiShutdown {
+    fn drop(&mut self) {
+        self.listener.abort();
+    }
+}
+
 /// Return a cancellation token that is tripped by the terminal interrupt or
 /// process termination signals used by supervisors such as GNU timeout.
 pub fn one_shot_cancellation_token() -> Result<CancellationToken> {

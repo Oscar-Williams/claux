@@ -210,8 +210,15 @@ impl HomeScreen {
     }
 
     /// Run the home screen event loop. Returns an Action.
-    pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<Action> {
+    pub fn run(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Result<Action> {
         loop {
+            if shutdown.is_cancelled() {
+                return Ok(Action::Quit);
+            }
             terminal.draw(|f| self.draw(f))?;
 
             if event::poll(std::time::Duration::from_millis(50))? {

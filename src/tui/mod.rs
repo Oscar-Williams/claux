@@ -42,134 +42,171 @@ pub async fn run(
     let db_path = crate::session::db_path()?;
     let db = Db::open(&db_path)?;
 
+    let shutdown = crate::shutdown::TuiShutdown::listen()?;
     let mut terminal_guard = TerminalGuard::enter()?;
 
     let theme = Theme::dark();
     let mut engine: Option<Engine> = None;
     let mut engine_binding: Option<ModelBinding> = None;
     let mut home_notice = None;
+    let mut active_session = None;
+    let mut forced_shutdown = false;
 
-    let app_result: Result<()> = async {
-        // Screen loop: home -> chat -> home -> ...
-        let mut next_action = Action::Home;
-        loop {
-            tracing::debug!("TUI action: {next_action:?}");
-            match next_action {
-                Action::Home => {
-                    let mut home_screen =
-                        home::HomeScreen::new(Db::open(&db_path)?, theme, models.clone());
-                    if let Some(notice) = home_notice.take() {
-                        home_screen.set_notice(notice);
-                    }
-                    next_action = home_screen.run(terminal_guard.terminal_mut())?;
+    let app_result: Result<()> = {
+        let run = async {
+            // Screen loop: home -> chat -> home -> ...
+            let mut next_action = Action::Home;
+            loop {
+                if shutdown.token.is_cancelled() {
+                    return Ok(());
                 }
-                Action::Chat { session_id } => {
-                    let session = db
-                        .get_session(&session_id)?
-                        .ok_or_else(|| anyhow::anyhow!("session {session_id} no longer exists"))?;
-                    let resolved = match session.model_binding.as_ref() {
-                        Some(binding) => config.resolve_binding(binding),
-                        None => config.resolve_model(&session.model).map_err(|error| {
-                            anyhow::anyhow!(
-                                "Legacy session '{}' uses model '{}': {error}",
-                                session.id,
-                                session.model
-                            )
-                        }),
-                    };
-                    let resolved = match resolved {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            home_notice = Some(format!(
+                // Only the currently running chat owns unsaved engine state.
+                // Provider setup for a new session must not overwrite an old one.
+                active_session = None;
+                tracing::debug!("TUI action: {next_action:?}");
+                match next_action {
+                    Action::Home => {
+                        let mut home_screen =
+                            home::HomeScreen::new(Db::open(&db_path)?, theme, models.clone());
+                        if let Some(notice) = home_notice.take() {
+                            home_screen.set_notice(notice);
+                        }
+                        next_action =
+                            home_screen.run(terminal_guard.terminal_mut(), &shutdown.token)?;
+                    }
+                    Action::Chat { session_id } => {
+                        let session = db.get_session(&session_id)?.ok_or_else(|| {
+                            anyhow::anyhow!("session {session_id} no longer exists")
+                        })?;
+                        let resolved = match session.model_binding.as_ref() {
+                            Some(binding) => config.resolve_binding(binding),
+                            None => config.resolve_model(&session.model).map_err(|error| {
+                                anyhow::anyhow!(
+                                    "Legacy session '{}' uses model '{}': {error}",
+                                    session.id,
+                                    session.model
+                                )
+                            }),
+                        };
+                        let resolved = match resolved {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                home_notice = Some(format!(
                                 "Cannot open '{}': {error}. Restore its profile or create a new chat.",
                                 session.name.as_deref().unwrap_or(&session.id)
                             ));
-                            next_action = Action::Home;
-                            continue;
-                        }
-                    };
-                    if engine_binding.as_ref() != Some(&resolved.binding) {
-                        match crate::build_engine(config, &resolved, plugins.clone()).await {
-                            Ok(new_engine) => {
-                                engine = Some(new_engine);
-                                engine_binding = Some(resolved.binding.clone());
-                            }
-                            Err(error) => {
-                                home_notice = Some(format!(
-                                    "Cannot open '{}': {error}",
-                                    session.name.as_deref().unwrap_or(&session.id)
-                                ));
                                 next_action = Action::Home;
                                 continue;
                             }
-                        }
-                    }
-                    let engine = engine.as_mut().expect("engine initialized");
-                    let system_prompt = context::build_system_prompt_for_model(
-                        &resolved.binding.model,
-                        Some(&plugins),
-                        &HookTrigger::OnContextBuild,
-                        resolved.binding.provider_kind == ProviderKind::Anthropic,
-                        config.is_project_trusted(),
-                    )
-                    .await?;
-                    engine.set_system_prompt(system_prompt);
-                    next_action = chat::run(
-                        engine,
-                        &session_id,
-                        &db,
-                        terminal_guard.terminal_mut(),
-                        theme,
-                        &models,
-                    )
-                    .await?;
-                    engine_binding = engine.model_binding().cloned();
-                }
-                Action::SwitchModel {
-                    session_id,
-                    selector,
-                } => {
-                    let session = db.get_session(&session_id)?.ok_or_else(|| {
-                        anyhow::anyhow!("session {session_id} no longer exists")
-                    })?;
-                    match config.resolve_model(&selector) {
-                        Ok(resolved) => {
+                        };
+                        if engine_binding.as_ref() != Some(&resolved.binding) {
                             match crate::build_engine(config, &resolved, plugins.clone()).await {
                                 Ok(new_engine) => {
-                                    // Only persist the selection after its
-                                    // provider and credentials validate. A
-                                    // typo or unavailable key must not strand
-                                    // an otherwise usable saved session.
-                                    db.update_session_binding(&session_id, &resolved.binding)?;
                                     engine = Some(new_engine);
-                                    engine_binding = Some(resolved.binding);
-                                    next_action = Action::Chat { session_id };
+                                    engine_binding = Some(resolved.binding.clone());
                                 }
                                 Err(error) => {
                                     home_notice = Some(format!(
-                                        "Cannot switch '{}': {error}",
+                                        "Cannot open '{}': {error}",
                                         session.name.as_deref().unwrap_or(&session.id)
                                     ));
                                     next_action = Action::Home;
+                                    continue;
                                 }
                             }
                         }
-                        Err(error) => {
-                            home_notice = Some(format!(
-                                "Cannot switch '{}': {error}",
-                                session.name.as_deref().unwrap_or(&session.id)
-                            ));
-                            next_action = Action::Home;
+                        let engine = engine.as_mut().expect("engine initialized");
+                        let system_prompt = context::build_system_prompt_for_model(
+                            &resolved.binding.model,
+                            Some(&plugins),
+                            &HookTrigger::OnContextBuild,
+                            resolved.binding.provider_kind == ProviderKind::Anthropic,
+                            config.is_project_trusted(),
+                        )
+                        .await?;
+                        engine.set_system_prompt(system_prompt);
+                        active_session = Some(session_id.clone());
+                        next_action = chat::run(
+                            engine,
+                            &session_id,
+                            &db,
+                            terminal_guard.terminal_mut(),
+                            theme,
+                            &models,
+                            &shutdown.token,
+                        )
+                        .await?;
+                        engine_binding = engine.model_binding().cloned();
+                    }
+                    Action::SwitchModel {
+                        session_id,
+                        selector,
+                    } => {
+                        let session = db.get_session(&session_id)?.ok_or_else(|| {
+                            anyhow::anyhow!("session {session_id} no longer exists")
+                        })?;
+                        match config.resolve_model(&selector) {
+                            Ok(resolved) => {
+                                match crate::build_engine(config, &resolved, plugins.clone()).await
+                                {
+                                    Ok(new_engine) => {
+                                        // Only persist the selection after its
+                                        // provider and credentials validate. A
+                                        // typo or unavailable key must not strand
+                                        // an otherwise usable saved session.
+                                        db.update_session_binding(&session_id, &resolved.binding)?;
+                                        engine = Some(new_engine);
+                                        engine_binding = Some(resolved.binding);
+                                        next_action = Action::Chat { session_id };
+                                    }
+                                    Err(error) => {
+                                        home_notice = Some(format!(
+                                            "Cannot switch '{}': {error}",
+                                            session.name.as_deref().unwrap_or(&session.id)
+                                        ));
+                                        next_action = Action::Home;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                home_notice = Some(format!(
+                                    "Cannot switch '{}': {error}",
+                                    session.name.as_deref().unwrap_or(&session.id)
+                                ));
+                                next_action = Action::Home;
+                            }
                         }
                     }
+                    Action::Quit => return Ok(()),
                 }
-                Action::Quit => return Ok(()),
+            }
+        };
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => result,
+            _ = shutdown.token.cancelled() => {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), &mut run).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        forced_shutdown = true;
+                        Err(anyhow::anyhow!("Shutdown did not complete within five seconds."))
+                    }
+                }
+            }
+        }
+    };
+
+    let restore_result = terminal_guard.restore();
+
+    if forced_shutdown {
+        if let (Some(session_id), Some(engine)) = (&active_session, &engine) {
+            let messages = crate::session::repair_history(engine.messages().to_vec());
+            if let Err(error) = db.replace_messages(session_id, &messages) {
+                tracing::warn!("Failed to save interrupted session: {error}");
             }
         }
     }
-    .await;
 
-    let restore_result = terminal_guard.restore();
     app_result?;
     restore_result?;
 
