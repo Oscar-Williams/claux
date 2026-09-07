@@ -119,6 +119,28 @@ pub struct FailureRecord {
 }
 
 impl FailureRecord {
+    /// A turn ended by the user or a shutdown signal.
+    pub fn cancelled(attempts: u32) -> Self {
+        Self {
+            kind: ApiFailureKind::Cancelled,
+            retryable: false,
+            http_status: None,
+            retry_after_ms: None,
+            attempts,
+        }
+    }
+
+    /// An error the engine could not classify further.
+    pub fn unclassified() -> Self {
+        Self {
+            kind: ApiFailureKind::Other,
+            retryable: false,
+            http_status: None,
+            retry_after_ms: None,
+            attempts: 1,
+        }
+    }
+
     fn from_failure(failure: &ApiFailure, attempts: u32) -> Self {
         Self {
             kind: failure.kind,

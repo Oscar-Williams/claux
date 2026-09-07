@@ -288,12 +288,66 @@ other automation:
     "cache_read_tokens": 67,
     "cache_creation_tokens": 0,
     "cost_usd": 0.00123
-  }
+  },
+  "outcome": { "status": "completed", "result": "..." }
 }
 ```
 
 `cost_usd` uses provider-reported cost when available, otherwise configured or
 built-in model pricing. It is `null` when neither source is available.
+
+The JSON document is written on failure too, so a supervisor never has to
+parse stderr. `result` is then `null` and `outcome` classifies what happened:
+
+```json
+{
+  "schema_version": 1,
+  "result": null,
+  "model": "deepseek/deepseek-v4-flash",
+  "usage": { "input_tokens": 9000, "output_tokens": 300, "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost_usd": null },
+  "outcome": {
+    "status": "error",
+    "message": "API error: openrouter API error (429 Too Many Requests) ...",
+    "failure": { "kind": "rate_limited", "retryable": true, "http_status": 429, "retry_after_ms": 20000, "attempts": 4 }
+  }
+}
+```
+
+`failure.kind` is one of `context_exceeded`, `output_limit_exceeded`,
+`malformed_tool_arguments`, `rate_limited`, `unavailable`, `authentication`,
+`model_not_found`, `policy_rejection`, `protocol_error`, `network`,
+`cancelled`, or `other`. The same object appears under `outcome.failure` in
+the transcript. Both additions are backwards compatible with the existing
+schema versions.
+
+Rate limits, provider 5xx responses, and transport failures are retried up to
+three times with exponential backoff before the turn fails, honoring a capped
+`Retry-After` when the provider sends one. Retries never reissue a request
+after a tool call has been surfaced, and waiting stops immediately on `SIGINT`
+or `SIGTERM`. Each retry is recorded as a model round with `status: "retry"`
+and its failure kind in the transcript.
+
+The one-shot exit status encodes the failure kind so a caller that does not
+read JSON can still tell a rate limit from a bad credential:
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | completed |
+| `1` | unclassified error, including configuration errors before the engine starts |
+| `2` | usage error (invalid arguments) |
+| `10` | cancelled by `SIGINT` or `SIGTERM` |
+| `11` | provider rate limited or unavailable after retries |
+| `12` | authentication or billing rejected |
+| `13` | context window exceeded after compaction attempts |
+| `14` | provider policy rejection |
+| `15` | protocol error, including malformed tool arguments and empty completions |
+| `16` | model or endpoint not found |
+| `17` | network failure after retries |
+| `18` | output token limit reached at the maximum budget |
+
+Codes `10` through `18` never collide with SSH's `255` or the shell's `126`,
+`127`, and `128+signal` codes, so a supervisor running claux over SSH can
+attribute a failure correctly.
 
 `--transcript FILE` writes a separate, versioned JSON artifact containing the
 final conversation state, outcome, usage, and a complete ordered tool trace.

@@ -1,27 +1,47 @@
 use crate::api::Message;
 use crate::cost::{CostTracker, UsageSummary};
-use crate::query::{ExecutionTiming, ToolTraceEntry};
+use crate::query::{ExecutionTiming, FailureRecord, ToolTraceEntry};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+/// One-shot `--output-format json` payload. Written on success and on
+/// failure; `result` is null and `outcome` carries the classified failure
+/// when the turn did not complete. Additive to schema version 1.
 #[derive(Debug, Serialize)]
 pub struct OneShotOutput<'a> {
     pub schema_version: u8,
-    pub result: &'a str,
+    pub result: Option<&'a str>,
     pub model: &'a str,
     pub usage: UsageSummary,
+    pub outcome: TranscriptOutcome<'a>,
 }
 
 impl<'a> OneShotOutput<'a> {
     pub fn new(result: &'a str, model: &'a str, cost: &CostTracker) -> Self {
         Self {
             schema_version: 1,
-            result,
+            result: Some(result),
             model,
             usage: cost.usage_summary(),
+            outcome: TranscriptOutcome::Completed { result },
+        }
+    }
+
+    pub fn failed(
+        model: &'a str,
+        cost: &CostTracker,
+        message: &'a str,
+        failure: Option<&'a FailureRecord>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            result: None,
+            model,
+            usage: cost.usage_summary(),
+            outcome: TranscriptOutcome::Error { message, failure },
         }
     }
 }
@@ -41,8 +61,15 @@ pub struct OneShotTranscript<'a> {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TranscriptOutcome<'a> {
     Running,
-    Completed { result: &'a str },
-    Error { message: &'a str },
+    Completed {
+        result: &'a str,
+    },
+    Error {
+        message: &'a str,
+        /// Classified failure, when the engine could determine one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<&'a FailureRecord>,
+    },
 }
 
 impl<'a> OneShotTranscript<'a> {
@@ -52,19 +79,13 @@ impl<'a> OneShotTranscript<'a> {
         messages: &'a [Message],
         tool_trace: &'a [ToolTraceEntry],
         timing: ExecutionTiming,
-        result: Option<&'a str>,
-        error: Option<&'a str>,
+        outcome: TranscriptOutcome<'a>,
     ) -> Self {
-        debug_assert!(result.is_some() ^ error.is_some());
+        debug_assert!(!matches!(outcome, TranscriptOutcome::Running));
         Self {
             schema_version: 2,
             model,
-            outcome: match error {
-                Some(message) => TranscriptOutcome::Error { message },
-                None => TranscriptOutcome::Completed {
-                    result: result.unwrap_or_default(),
-                },
-            },
+            outcome,
             usage: cost.usage_summary(),
             messages,
             tool_trace,
@@ -174,7 +195,10 @@ mod tests {
                     "cache_read_tokens": 8,
                     "cache_creation_tokens": 2,
                     "cost_usd": 0.00042
-                }
+                },
+                // Additive: consumers pinned to schema 1 still find every
+                // field they read.
+                "outcome": { "status": "completed", "result": "done" }
             })
         );
     }
@@ -222,8 +246,7 @@ mod tests {
                     }),
                 }],
             },
-            Some("done"),
-            None,
+            TranscriptOutcome::Completed { result: "done" },
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/transcript.json");
@@ -260,8 +283,28 @@ mod tests {
     }
 
     #[test]
+    fn failed_one_shot_output_carries_outcome_and_null_result() {
+        let cost = CostTracker::new("test/model");
+        let failure = FailureRecord::cancelled(2);
+        let value = serde_json::to_value(OneShotOutput::failed(
+            "test/model",
+            &cost,
+            "Interrupted by shutdown signal.",
+            Some(&failure),
+        ))
+        .unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert!(value["result"].is_null());
+        assert_eq!(value["outcome"]["status"], "error");
+        assert_eq!(value["outcome"]["failure"]["kind"], "cancelled");
+        assert_eq!(value["outcome"]["failure"]["attempts"], 2);
+        assert_eq!(value["outcome"]["failure"]["retryable"], false);
+    }
+
+    #[test]
     fn records_failed_outcome() {
         let cost = CostTracker::new("test/model");
+        let failure = FailureRecord::unclassified();
         let transcript = OneShotTranscript::new(
             "test/model",
             &cost,
@@ -271,13 +314,16 @@ mod tests {
                 total_duration_ms: 0,
                 model_rounds: vec![],
             },
-            None,
-            Some("provider disconnected"),
+            TranscriptOutcome::Error {
+                message: "provider disconnected",
+                failure: Some(&failure),
+            },
         );
 
         let value = serde_json::to_value(transcript).unwrap();
         assert_eq!(value["outcome"]["status"], "error");
         assert_eq!(value["outcome"]["message"], "provider disconnected");
+        assert_eq!(value["outcome"]["failure"]["kind"], "other");
     }
 
     #[test]
@@ -308,8 +354,7 @@ mod tests {
                 &messages,
                 &[],
                 timing,
-                Some("done"),
-                None,
+                TranscriptOutcome::Completed { result: "done" },
             ),
         )
         .unwrap();
