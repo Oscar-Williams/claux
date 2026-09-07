@@ -58,6 +58,7 @@ pub struct Activity {
 
 /// Chat screen state.
 pub struct ChatApp {
+    pub save_error: Option<String>,
     pub expand_tool_output: bool,
     pub activity: Option<Activity>,
     pub messages: Vec<ChatMessage>,
@@ -100,6 +101,7 @@ pub struct ChatApp {
 impl ChatApp {
     pub fn new(model: &str, theme: Theme) -> Self {
         Self {
+            save_error: None,
             expand_tool_output: false,
             activity: None,
             messages: Vec::new(),
@@ -134,6 +136,27 @@ impl ChatApp {
             role: crate::utils::sanitize_terminal_text(role),
             content: crate::utils::sanitize_terminal_text(content),
         });
+    }
+
+    fn save_session(&mut self, db: &Db, session_id: &str, engine: &Engine) -> bool {
+        self.record_save(db.save_snapshot(session_id, engine.messages(), engine.model_binding()))
+    }
+
+    fn record_save(&mut self, result: Result<()>) -> bool {
+        match result {
+            Ok(()) => {
+                self.save_error = None;
+                true
+            }
+            Err(error) => {
+                let message = crate::utils::sanitize_terminal_text(&format!("{error:#}"));
+                if self.save_error.as_ref() != Some(&message) {
+                    self.add_message("error", &format!("Session is UNSAVED: {message}\nKeep this chat open. Ctrl+S retries saving."));
+                }
+                self.save_error = Some(message);
+                false
+            }
+        }
     }
 
     pub fn set_activity(&mut self, label: &str) {
@@ -435,6 +458,12 @@ pub async fn run(
 
     loop {
         if shutdown.is_cancelled() {
+            if !app.save_session(db, session_id, engine) {
+                anyhow::bail!(
+                    "Session {session_id} could not be saved during shutdown: {}",
+                    app.save_error.as_deref().unwrap_or("unknown error")
+                );
+            }
             return Ok(Action::Quit);
         }
         if needs_redraw {
@@ -445,6 +474,20 @@ pub async fn run(
         // Process pending submit
         if let Some(input) = pending_submit.take() {
             let trimmed = input.trim().to_string();
+
+            // Commands may clear history or switch sessions. Do not let an
+            // outstanding save failure silently discard the only good copy.
+            if trimmed.starts_with('/')
+                && app.save_error.is_some()
+                && !app.save_session(db, session_id, engine)
+            {
+                app.add_message(
+                    "error",
+                    "Command paused because this session is unsaved. Ctrl+S retries.",
+                );
+                needs_redraw = true;
+                continue;
+            }
 
             // /home is a screen transition, so it returns Action::Home rather
             // than routing through parse_command like the rest. It is still
@@ -495,7 +538,10 @@ pub async fn run(
                                 // Return there so switching profiles rebuilds
                                 // the engine instead of merely changing a model
                                 // string on the current provider.
-                                db.replace_messages(session_id, engine.messages())?;
+                                if !app.save_session(db, session_id, engine) {
+                                    needs_redraw = true;
+                                    continue;
+                                }
                                 return Ok(Action::SwitchModel {
                                     session_id: session_id.to_string(),
                                     selector,
@@ -537,10 +583,7 @@ pub async fn run(
                                 Err(e) => app.add_message("error", &format!("Error: {e}")),
                             }
                             // Commands like /compact rewrite engine history
-                            let _ = db.replace_messages(session_id, engine.messages());
-                            if let Some(binding) = engine.model_binding() {
-                                let _ = db.update_session_binding(session_id, binding);
-                            }
+                            app.save_session(db, session_id, engine);
                         }
                     },
                 }
@@ -579,9 +622,7 @@ pub async fn run(
             // Previously only the user message and the final assistant
             // message were saved, so resumed sessions lost everything the
             // turn actually did.
-            if let Err(e) = db.replace_messages(session_id, engine.messages()) {
-                tracing::warn!("Failed to save session: {e}");
-            }
+            app.save_session(db, session_id, engine);
 
             app.mode = Mode::Input;
             app.status = format!(
@@ -600,6 +641,16 @@ pub async fn run(
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
+                    if key.kind == event::KeyEventKind::Release {
+                        continue;
+                    }
+                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('s') {
+                        if app.save_session(db, session_id, engine) {
+                            app.status = "Session saved".to_string();
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
                     // Enter submits, unless the completion menu has claimed it to
                     // accept the highlighted command. Ask the app rather than
                     // deciding here: the caller cannot see the menu state.
@@ -624,9 +675,19 @@ pub async fn run(
         }
 
         if app.should_exit {
+            if app.save_error.is_some() && !app.save_session(db, session_id, engine) {
+                app.should_exit = false;
+                needs_redraw = true;
+                continue;
+            }
             return Ok(Action::Quit);
         }
         if app.should_go_home {
+            if app.save_error.is_some() && !app.save_session(db, session_id, engine) {
+                app.should_go_home = false;
+                needs_redraw = true;
+                continue;
+            }
             return Ok(Action::Home);
         }
     }
@@ -1450,6 +1511,46 @@ mod turn_tests {
 
     struct ScriptedEvents(std::collections::VecDeque<Event>);
 
+    #[test]
+    fn save_failure_remains_visible_until_real_database_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let db = Db::open(&path).unwrap();
+        db.create_session("s", "test", None, None).unwrap();
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute_batch("CREATE TRIGGER reject_save BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk unavailable'); END;").unwrap();
+        let mut engine = scripted_engine(vec![], None, PermissionMode::Default);
+        engine.set_messages(vec![crate::api::Message::user("keep this draft")]);
+        let mut app = ChatApp::new("test", Theme::dark());
+        assert!(!app.save_session(&db, "s", &engine));
+        assert!(app
+            .save_error
+            .as_deref()
+            .unwrap()
+            .contains("disk unavailable"));
+        app.status = "unrelated token update".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw_chat(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("UNSAVED"));
+        let count = app.messages.len();
+        assert!(!app.save_session(&db, "s", &engine));
+        assert_eq!(
+            app.messages.len(),
+            count,
+            "repeated failures do not flood chat"
+        );
+        assert_eq!(engine.messages().len(), 1);
+        other.execute_batch("DROP TRIGGER reject_save").unwrap();
+        assert!(app.save_session(&db, "s", &engine));
+        assert!(app.save_error.is_none());
+        assert_eq!(db.get_messages("s").unwrap().len(), 1);
+        terminal.draw(|f| ui::draw_chat(f, &mut app)).unwrap();
+        // Historical error stays in the transcript, but the footer recovers.
+        let screen = buffer_text(&terminal);
+        let footer = crate::utils::tail_str(&screen, 100);
+        assert!(!footer.contains("UNSAVED"));
+    }
+
     impl KeySource for ScriptedEvents {
         fn poll_event(&mut self) -> Result<Option<Event>> {
             Ok(self.0.pop_front())
@@ -1998,6 +2099,12 @@ mod tuishot_shots {
         ToolOutput,
 
         #[tuishot(
+            name = "chat-unsaved",
+            description = "Persistent save failure and retry hint"
+        )]
+        Unsaved,
+
+        #[tuishot(
             name = "chat-permission",
             description = "Prompting for Bash permission"
         )]
@@ -2073,6 +2180,11 @@ mod tuishot_shots {
                 ChatShot::Empty => {
                     let mut app = ChatApp::new("claude-sonnet-4-20250514", theme);
                     app.version = SNAPSHOT_VERSION.to_string();
+                    app
+                }
+                ChatShot::Unsaved => {
+                    let mut app = sample_conversation();
+                    app.record_save(Err(anyhow::anyhow!("database is read-only")));
                     app
                 }
             };

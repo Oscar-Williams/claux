@@ -589,8 +589,16 @@ fn draw_input_and_status(
     let status = Paragraph::new(Line::from(vec![
         Span::styled(thinking_indicator, Style::default().fg(app.theme.success)),
         Span::styled(
-            format!(" {} ", app.status),
-            Style::default().fg(app.theme.dim),
+            if app.save_error.is_some() {
+                " UNSAVED · Ctrl+S retry · keep this chat open ".to_string()
+            } else {
+                format!(" {} ", app.status)
+            },
+            Style::default().fg(if app.save_error.is_some() {
+                app.theme.tool_error
+            } else {
+                app.theme.dim
+            }),
         ),
     ]));
     f.render_widget(status, chunks[3]);

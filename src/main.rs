@@ -13,6 +13,7 @@ mod db;
 #[cfg(test)]
 mod evals;
 mod image_input;
+mod logging;
 mod model;
 mod model_catalog;
 mod onboarding;
@@ -58,7 +59,7 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(logging::writer)
         .init();
 
     if let Some(command) = &args.command {
