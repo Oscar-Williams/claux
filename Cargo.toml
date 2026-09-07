@@ -85,3 +85,6 @@ nix = { version = "0.31", features = ["signal"] }
 [dev-dependencies]
 tempfile = "3.0"
 tuishot = { git = "https://github.com/ducks/tuishot" }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["term"] }

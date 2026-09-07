@@ -25,6 +25,7 @@ A terminal-based AI coding assistant written in Rust. Streams responses, execute
 - **Context assembly** — git status, CLAUDE.md, environment info in system prompt. Checked-in CLAUDE.md is loaded only for trusted projects (the user's `~/.claude/CLAUDE.md` always is), and each file is size-capped
 - **TUI mode** — full-screen ratatui interface with `--tui`
 - **Visible activity**: the input border shows whether the model is responding, tools are queued, or a tool is executing, with elapsed time and a notice after ten seconds without updates. Tool completions appear as they happen, even while other tools in the batch are pending. The animation shows that the UI is responsive; Bash output is still collected until the command finishes. Ctrl+C interrupts a silent turn.
+- **Terminal restoration**: the TUI restores keyboard modes, bracketed paste, colors, the main screen, and the cursor on exit, startup failure, or panic unwinding. On Unix, SIGTERM, SIGHUP, and external SIGINT request a graceful shutdown, including cancellation and session saving. If shutdown takes more than five seconds, Claux stops waiting, restores the terminal, and attempts to save repaired partial history. SIGKILL cannot be handled; use `reset` if a forced kill leaves your shell in raw mode.
 - **Multi-provider** — Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint
 - **Native system prompt** — claux speaks as claux; the full prompt is readable in `src/context.rs`, and what you read is what the model gets
 - **Markdown rendering** — code blocks, bold, headers in the TUI

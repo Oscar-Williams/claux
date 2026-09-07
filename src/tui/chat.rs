@@ -375,6 +375,7 @@ pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     theme: Theme,
     models: &[ResolvedModel],
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Action> {
     // Clear engine state and load this session's messages. repair_history
     // makes old or crash-interrupted saves API-valid (tool_use/tool_result
@@ -413,6 +414,9 @@ pub async fn run(
     let mut pending_submit: Option<String> = None;
 
     loop {
+        if shutdown.is_cancelled() {
+            return Ok(Action::Quit);
+        }
         if needs_redraw {
             terminal.draw(|f| ui::draw_chat(f, &mut app))?;
             needs_redraw = false;
@@ -536,8 +540,15 @@ pub async fn run(
 
             app.status = format!("{} | {}", app.model, engine.context_status());
 
-            let submit_result =
-                drive_streaming(engine, &trimmed, &mut app, terminal, &mut CrosstermKeys).await;
+            let submit_result = drive_streaming(
+                engine,
+                &trimmed,
+                &mut app,
+                terminal,
+                &mut CrosstermKeys,
+                shutdown,
+            )
+            .await;
 
             if let Err(e) = submit_result {
                 app.add_message("error", &format!("Error: {e}"));
@@ -614,11 +625,12 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
     app: &mut ChatApp,
     terminal: &mut Terminal<B>,
     keys: &mut dyn KeySource,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     app.set_activity("Waiting for model response");
     let steering = engine.steering_queue();
     let steer_buf = app.steer_buf.clone();
-    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel = shutdown.child_token();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
 
     let mut submit_result: Option<Result<()>> = None;
@@ -737,7 +749,9 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                         }
                         StreamEvent::PermissionRequest { tool_name, summary, input, respond }
                         | StreamEvent::PermissionRequestWithDiff { tool_name, summary, input, respond, .. } => {
-                            let response = prompt_permission_tui(
+                            let response = tokio::select! {
+                                _ = cancel.cancelled() => PermissionResponse::Deny,
+                                response = prompt_permission_tui(
                                 app,
                                 terminal,
                                 keys,
@@ -746,8 +760,8 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                                 &summary,
                                 &input,
                                 &steering,
-                            )
-                            .await?;
+                            ) => response?,
+                            };
                             // Denying outright ends the turn (the engine
                             // pairs the rest of the batch as interrupted);
                             // DenyAndCancel instead queued steering, which
@@ -1505,9 +1519,16 @@ mod turn_tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut keys = ScriptedKeys(keystrokes.into());
 
-        drive_streaming(engine, "go", &mut app, &mut terminal, &mut keys)
-            .await
-            .unwrap();
+        drive_streaming(
+            engine,
+            "go",
+            &mut app,
+            &mut terminal,
+            &mut keys,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         // Final frame with the settled state
         app.mode = Mode::Input;
@@ -1719,6 +1740,51 @@ mod turn_tests {
             "steering delivered: {:?}",
             engine.messages()
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_tools_and_permission_waits_with_paired_history() {
+        for mode in [PermissionMode::Bypass, PermissionMode::Default] {
+            let mut engine = scripted_engine(
+                vec![tool_use(
+                    "shutdown-tool",
+                    "Bash",
+                    serde_json::json!({"command": "sleep 5"}),
+                )],
+                None,
+                mode,
+            );
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let mut app = ChatApp::new("test-model", Theme::dark());
+            app.mode = Mode::Streaming;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let mut keys = ScriptedKeys(Vec::new().into());
+            let turn = drive_streaming(
+                &mut engine,
+                "go",
+                &mut app,
+                &mut terminal,
+                &mut keys,
+                &shutdown,
+            );
+            let signal = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                shutdown.cancel();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(turn, signal)
+            })
+            .await
+            .expect("shutdown should not wait for the command or permission");
+            result.unwrap();
+            assert_eq!(tool_statuses(&app), vec![ToolStatus::Error]);
+            assert_eq!(
+                serde_json::to_value(crate::session::repair_history(engine.messages().to_vec()))
+                    .unwrap(),
+                serde_json::to_value(engine.messages()).unwrap(),
+                "shutdown must finish pairing tool uses before the session is saved",
+            );
+        }
     }
 }
 
