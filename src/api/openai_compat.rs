@@ -257,12 +257,15 @@ impl Provider for OpenAICompatProvider {
         }
 
         let response = tokio::select! {
-            _ = cancel.cancelled() => anyhow::bail!("API request cancelled"),
+            _ = cancel.cancelled() => return Err(super::error::cancelled_error()),
             result = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
                 request.json(&body).send(),
-            ) => result
-                .map_err(|_| anyhow::anyhow!("API request timed out waiting for response headers"))??,
+            ) => match result {
+                Err(_) => return Err(super::error::headers_timeout_error(&self.provider_name, &self.model)),
+                Ok(Err(error)) => return Err(super::error::transport_error(error, &self.provider_name, &self.model)),
+                Ok(Ok(response)) => response,
+            },
         };
 
         if !response.status().is_success() {

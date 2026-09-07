@@ -10,7 +10,8 @@ use std::fmt;
 /// happens to contain "413" would trigger a compaction that discards history)
 /// and depends on wording that OpenAI-compatible endpoints do not treat as
 /// contractual.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApiFailureKind {
     /// The request exceeded the model's input context window.
     ContextExceeded,
@@ -18,8 +19,69 @@ pub enum ApiFailureKind {
     OutputLimitExceeded,
     /// The model emitted tool-call arguments that are not valid JSON.
     MalformedToolArguments,
+    /// The provider throttled the request (HTTP 429). Retryable.
+    RateLimited,
+    /// The provider or its upstream is temporarily unable to serve the
+    /// request (HTTP 5xx, overloaded). Retryable.
+    Unavailable,
+    /// The credential was rejected or the account cannot be billed.
+    Authentication,
+    /// The model or endpoint does not exist for this provider.
+    ModelNotFound,
+    /// The provider refused the content on policy grounds.
+    PolicyRejection,
+    /// The response violated the protocol claux expected: truncated
+    /// stream, unparseable frames, an empty completion.
+    ProtocolError,
+    /// The request never completed at the transport level: connection
+    /// refused or reset, DNS failure, timeout. Retryable.
+    Network,
+    /// The request was cancelled by the user or a shutdown signal.
+    Cancelled,
     /// Anything not separately actionable.
     Other,
+}
+
+impl ApiFailureKind {
+    /// Whether reissuing the same request may succeed without any change.
+    pub fn retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Unavailable | Self::Network)
+    }
+
+    /// The stable snake_case name used in JSON outputs and by consumers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextExceeded => "context_exceeded",
+            Self::OutputLimitExceeded => "output_limit_exceeded",
+            Self::MalformedToolArguments => "malformed_tool_arguments",
+            Self::RateLimited => "rate_limited",
+            Self::Unavailable => "unavailable",
+            Self::Authentication => "authentication",
+            Self::ModelNotFound => "model_not_found",
+            Self::PolicyRejection => "policy_rejection",
+            Self::ProtocolError => "protocol_error",
+            Self::Network => "network",
+            Self::Cancelled => "cancelled",
+            Self::Other => "other",
+        }
+    }
+
+    /// Process exit code for a one-shot run that ended with this failure.
+    /// 1 stays the generic failure; 2 is reserved for usage errors.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Cancelled => 10,
+            Self::RateLimited | Self::Unavailable => 11,
+            Self::Authentication => 12,
+            Self::ContextExceeded => 13,
+            Self::PolicyRejection => 14,
+            Self::ProtocolError | Self::MalformedToolArguments => 15,
+            Self::ModelNotFound => 16,
+            Self::Network => 17,
+            Self::OutputLimitExceeded => 18,
+            Self::Other => 1,
+        }
+    }
 }
 
 /// A provider failure: a classification the turn loop matches on, plus the
@@ -28,6 +90,10 @@ pub enum ApiFailureKind {
 pub struct ApiFailure {
     pub kind: ApiFailureKind,
     pub message: String,
+    /// HTTP status of the failing response, when there was one.
+    pub http_status: Option<u16>,
+    /// Provider-requested wait before retrying, when it sent one.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ApiFailure {
@@ -35,7 +101,27 @@ impl ApiFailure {
         Self {
             kind,
             message: message.into(),
+            http_status: None,
+            retry_after: None,
         }
+    }
+
+    pub fn with_status(mut self, status: Option<StatusCode>) -> Self {
+        self.http_status = status.map(|status| status.as_u16());
+        self
+    }
+
+    pub fn with_retry_after(mut self, retry_after: Option<std::time::Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::new(ApiFailureKind::Cancelled, message)
+    }
+
+    pub fn protocol_error(message: impl Into<String>) -> Self {
+        Self::new(ApiFailureKind::ProtocolError, message)
     }
 
     /// An unclassified failure. Prefer a specific kind when one is known.
@@ -79,15 +165,57 @@ pub(super) fn classify_reader_error(error: &anyhow::Error) -> ApiFailure {
         return failure.clone();
     }
 
-    // `invalid arguments for tool call` / `invalid arguments for Anthropic
-    // tool call` are emitted by this crate's own SSE parsers.
+    // A body read that fails at the transport layer surfaces as reqwest's
+    // error type, not as provider prose.
+    if let Some(transport) = error.downcast_ref::<reqwest::Error>() {
+        return ApiFailure::new(
+            ApiFailureKind::Network,
+            format!("stream transport failed: {transport}"),
+        );
+    }
+
+    // The remaining markers are all emitted by this crate's own SSE
+    // readers: `invalid arguments for [Anthropic] tool call`, `stream
+    // ended ...`, `invalid JSON in ... SSE event`.
     let text = error.to_string();
     let kind = if text.contains("invalid arguments for") && text.contains("tool call") {
         ApiFailureKind::MalformedToolArguments
+    } else if text.contains("stream ended") || text.contains("SSE event") {
+        ApiFailureKind::ProtocolError
     } else {
         ApiFailureKind::Other
     };
     ApiFailure::new(kind, text)
+}
+
+/// A request that failed before a response arrived.
+pub(super) fn transport_error(error: reqwest::Error, provider: &str, model: &str) -> anyhow::Error {
+    let what = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "could not connect"
+    } else {
+        "failed"
+    };
+    anyhow::Error::new(ApiFailure::new(
+        ApiFailureKind::Network,
+        format!("{provider} API request {what} for model '{model}': {error}"),
+    ))
+}
+
+/// The bounded wait for response headers elapsed.
+pub(super) fn headers_timeout_error(provider: &str, model: &str) -> anyhow::Error {
+    anyhow::Error::new(ApiFailure::new(
+        ApiFailureKind::Network,
+        format!(
+            "{provider} API request timed out waiting for response headers for model '{model}'"
+        ),
+    ))
+}
+
+/// The request was cancelled before a response arrived.
+pub(super) fn cancelled_error() -> anyhow::Error {
+    anyhow::Error::new(ApiFailure::cancelled("API request cancelled"))
 }
 
 /// Classify an HTTP status plus provider-declared error type.
@@ -95,15 +223,64 @@ fn classify(status: Option<StatusCode>, error_type: Option<&str>) -> ApiFailureK
     if status == Some(StatusCode::PAYLOAD_TOO_LARGE) {
         return ApiFailureKind::ContextExceeded;
     }
+    // Provider-declared types are more specific than the status and are
+    // stable identifiers on the providers claux targets.
     match error_type {
         Some("context_length_exceeded") | Some("string_above_max_length") => {
-            ApiFailureKind::ContextExceeded
+            return ApiFailureKind::ContextExceeded
         }
         Some("max_output_tokens") | Some("max_tokens_exceeded") => {
-            ApiFailureKind::OutputLimitExceeded
+            return ApiFailureKind::OutputLimitExceeded
         }
+        Some("rate_limit_exceeded") | Some("rate_limit_error") | Some("insufficient_quota") => {
+            return ApiFailureKind::RateLimited
+        }
+        Some("overloaded_error")
+        | Some("provider_overloaded")
+        | Some("provider_unavailable")
+        | Some("api_error")
+        | Some("server_error") => return ApiFailureKind::Unavailable,
+        Some("authentication")
+        | Some("authentication_error")
+        | Some("invalid_api_key")
+        | Some("permission_denied")
+        | Some("permission_error")
+        | Some("payment_required") => return ApiFailureKind::Authentication,
+        Some("model_not_found") | Some("provider_model_not_found") | Some("not_found_error") => {
+            return ApiFailureKind::ModelNotFound
+        }
+        Some("content_policy_violation")
+        | Some("content_filter")
+        | Some("prohibited_content")
+        | Some("safety") => return ApiFailureKind::PolicyRejection,
+        Some("timeout") => return ApiFailureKind::Network,
+        _ => {}
+    }
+    match status {
+        Some(StatusCode::TOO_MANY_REQUESTS) => ApiFailureKind::RateLimited,
+        Some(StatusCode::UNAUTHORIZED)
+        | Some(StatusCode::FORBIDDEN)
+        | Some(StatusCode::PAYMENT_REQUIRED) => ApiFailureKind::Authentication,
+        Some(StatusCode::NOT_FOUND) => ApiFailureKind::ModelNotFound,
+        Some(StatusCode::REQUEST_TIMEOUT) | Some(StatusCode::GATEWAY_TIMEOUT) => {
+            ApiFailureKind::Network
+        }
+        Some(status) if status.is_server_error() => ApiFailureKind::Unavailable,
+        // Anthropic's overloaded status is not a registered code.
+        Some(status) if status.as_u16() == 529 => ApiFailureKind::Unavailable,
         _ => ApiFailureKind::Other,
     }
+}
+
+/// Parse a Retry-After header: seconds, or an HTTP date in the future.
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = when.signed_duration_since(chrono::Utc::now());
+    delta.to_std().ok()
 }
 
 pub(super) async fn http_error(response: Response, provider: &str, model: &str) -> anyhow::Error {
@@ -131,7 +308,9 @@ pub(super) async fn http_error(response: Response, provider: &str, model: &str) 
             error_type,
             message,
         ),
-    );
+    )
+    .with_status(Some(status))
+    .with_retry_after(retry_after.as_deref().and_then(parse_retry_after));
     anyhow::Error::new(failure)
 }
 
@@ -142,6 +321,7 @@ pub(super) fn stream_error(event: &Value, provider: &str, model: &str) -> ApiFai
         classify(status, error_type),
         format_error(provider, model, status, None, error_type, message),
     )
+    .with_status(status)
 }
 
 fn extract_details(value: &Value) -> (Option<&str>, Option<&str>) {
@@ -243,6 +423,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classifies_transient_auth_and_policy_failures() {
+        use ApiFailureKind as K;
+        let cases = [
+            (Some(429), None, K::RateLimited),
+            (Some(401), None, K::Authentication),
+            (Some(403), None, K::Authentication),
+            (Some(402), None, K::Authentication),
+            (Some(404), None, K::ModelNotFound),
+            (Some(500), None, K::Unavailable),
+            (Some(502), None, K::Unavailable),
+            (Some(503), None, K::Unavailable),
+            (Some(504), None, K::Network),
+            (Some(529), None, K::Unavailable),
+            (Some(400), None, K::Other),
+            (Some(400), Some("rate_limit_error"), K::RateLimited),
+            (Some(500), Some("overloaded_error"), K::Unavailable),
+            (
+                Some(400),
+                Some("content_policy_violation"),
+                K::PolicyRejection,
+            ),
+            (Some(400), Some("model_not_found"), K::ModelNotFound),
+            (
+                Some(400),
+                Some("context_length_exceeded"),
+                K::ContextExceeded,
+            ),
+            (None, Some("provider_unavailable"), K::Unavailable),
+        ];
+        for (status, error_type, expected) in cases {
+            let status = status.and_then(|code| StatusCode::from_u16(code).ok());
+            assert_eq!(
+                classify(status, error_type),
+                expected,
+                "status={status:?} type={error_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_transient_kinds_are_retryable() {
+        use ApiFailureKind as K;
+        for kind in [K::RateLimited, K::Unavailable, K::Network] {
+            assert!(kind.retryable(), "{kind:?}");
+        }
+        for kind in [
+            K::ContextExceeded,
+            K::OutputLimitExceeded,
+            K::MalformedToolArguments,
+            K::Authentication,
+            K::ModelNotFound,
+            K::PolicyRejection,
+            K::ProtocolError,
+            K::Cancelled,
+            K::Other,
+        ] {
+            assert!(!kind.retryable(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn exit_codes_are_distinct_and_avoid_ssh_and_shell_codes() {
+        use ApiFailureKind as K;
+        let kinds = [
+            K::Cancelled,
+            K::RateLimited,
+            K::Authentication,
+            K::ContextExceeded,
+            K::PolicyRejection,
+            K::ProtocolError,
+            K::ModelNotFound,
+            K::Network,
+            K::OutputLimitExceeded,
+        ];
+        let codes: std::collections::HashSet<u8> = kinds.iter().map(|k| k.exit_code()).collect();
+        assert_eq!(
+            codes.len(),
+            kinds.len(),
+            "each listed kind has its own code"
+        );
+        for code in codes {
+            assert!((10..=18).contains(&code), "{code}");
+        }
+        assert_eq!(K::Other.exit_code(), 1);
+        assert_eq!(K::Unavailable.exit_code(), K::RateLimited.exit_code());
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates() {
+        assert_eq!(
+            parse_retry_after("30"),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc2822();
+        let parsed = parse_retry_after(&future).unwrap();
+        assert!(
+            parsed.as_secs() >= 85 && parsed.as_secs() <= 90,
+            "{parsed:?}"
+        );
+        assert_eq!(parse_retry_after("soon"), None);
+    }
+
+    #[test]
+    fn reader_errors_classify_transport_and_protocol_markers() {
+        let protocol = classify_reader_error(&anyhow::anyhow!("stream ended before message_stop"));
+        assert_eq!(protocol.kind, ApiFailureKind::ProtocolError);
+        let json = classify_reader_error(&anyhow::anyhow!("invalid JSON in OpenAI SSE event: x"));
+        assert_eq!(json.kind, ApiFailureKind::ProtocolError);
+        let other = classify_reader_error(&anyhow::anyhow!("something else"));
+        assert_eq!(other.kind, ApiFailureKind::Other);
+    }
+
+    #[test]
     fn formats_rate_limit_with_retry_after() {
         let message = format_error(
             "openrouter",
@@ -310,13 +603,15 @@ mod tests {
 
     #[test]
     fn rate_limits_are_not_mistaken_for_context_or_output_limits() {
-        assert_eq!(
-            classify(
-                Some(StatusCode::TOO_MANY_REQUESTS),
-                Some("rate_limit_exceeded")
-            ),
-            ApiFailureKind::Other
+        let kind = classify(
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            Some("rate_limit_exceeded"),
         );
+        assert_eq!(kind, ApiFailureKind::RateLimited);
+        assert!(!matches!(
+            kind,
+            ApiFailureKind::ContextExceeded | ApiFailureKind::OutputLimitExceeded
+        ));
     }
 
     #[test]
@@ -335,7 +630,8 @@ mod tests {
         let failure = stream_error(&event, "openai", "model");
 
         assert!(failure.message.contains("req_413_88"));
-        assert_eq!(failure.kind, ApiFailureKind::Other);
+        assert_eq!(failure.kind, ApiFailureKind::Unavailable);
+        assert_eq!(failure.http_status, Some(500));
     }
 
     #[test]
@@ -355,7 +651,7 @@ mod tests {
 
     #[test]
     fn unrelated_reader_errors_stay_unclassified() {
-        let error = anyhow::anyhow!("stream ended before message_stop");
+        let error = anyhow::anyhow!("the provider said 429 things about 413 tokens");
 
         assert_eq!(classify_reader_error(&error).kind, ApiFailureKind::Other);
     }
