@@ -83,6 +83,7 @@ landlock = "0.4.4"
 nix = { version = "0.31", features = ["signal"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.0"
 tuishot = { git = "https://github.com/ducks/tuishot" }
 

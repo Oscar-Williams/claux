@@ -565,7 +565,7 @@ async fn read_openai_sse_body(
     loop {
         let chunk_result = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            chunk = stream.next() => chunk,
+            chunk = super::stream::next_with_idle_timeout(stream.next()) => chunk?,
         };
         let Some(chunk_result) = chunk_result else {
             break;
