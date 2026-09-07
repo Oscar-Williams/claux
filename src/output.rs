@@ -211,6 +211,7 @@ mod tests {
                     index: 1,
                     started_after_ms: 0,
                     duration_ms: 75,
+                    failure: None,
                     status: "completed".to_string(),
                     usage: Some(ModelRoundUsage {
                         input_tokens: 3,
