@@ -24,6 +24,8 @@ use crate::tools::ToolRegistry;
 /// hears the user without the tool sequence being aborted.
 pub type SteeringQueue = Arc<Mutex<VecDeque<String>>>;
 
+const MAX_PARALLEL_TOOLS: usize = 8;
+
 /// The query engine: conversation loop that sends messages, streams responses,
 /// dispatches tools, and continues until the assistant stops.
 pub struct Engine {
@@ -1537,9 +1539,9 @@ impl Engine {
 
     /// Execute one batch of tool calls.
     ///
-    /// Read-only tools that are auto-allowed run concurrently; everything
-    /// else runs sequentially in order (permission prompts are inherently
-    /// serial). A pending steering message supersedes the batch: tools not
+    /// Contiguous, auto-allowed read-only tools run in bounded parallel groups.
+    /// Mutations and permission decisions are ordering barriers. A pending
+    /// steering message supersedes the batch: tools not
     /// yet started get synthetic skipped results, and running tools are
     /// cancelled by their steering watchers. Result blocks come back in
     /// the original tool_use order.
@@ -1553,55 +1555,10 @@ impl Engine {
         let mut outputs: Vec<Option<TimedToolOutput>> =
             (0..tool_uses.len()).map(|_| None).collect();
 
-        // Classify up front. Only read-only AND auto-allowed tools run in
-        // parallel; the permission check is repeated for sequential tools
-        // below because an AlwaysAllow answer during the batch can change
-        // later results.
-        let mut parallel: Vec<usize> = Vec::new();
-        for (idx, (_, name, input)) in tool_uses.iter().enumerate() {
-            let ro = self.tools.is_read_only(name);
-            if ro
-                && matches!(
-                    self.decide_permission(name, input, ro).await,
-                    PermissionResult::Allow
-                )
-            {
-                parallel.push(idx);
-            }
-        }
-
         let mut interrupted = false;
+        // Retain a read-only barrier's decision so its hook runs only once.
+        let mut pending_permission = None;
 
-        // Phase 1: run the parallel group concurrently. Tool impls take
-        // &self, so concurrent immutable borrows are safe.
-        if !self.steering_pending() && !cancel.is_cancelled() && !parallel.is_empty() {
-            let this: &Self = &*self;
-            let futures: Vec<_> = parallel
-                .iter()
-                .map(|&idx| {
-                    let (_, name, input) = &tool_uses[idx];
-                    let started_after_ms = this.trace_offset_ms();
-                    async move {
-                        let started = Instant::now();
-                        (
-                            idx,
-                            TimedToolOutput {
-                                output: this
-                                    .execute_tool_steerable(name, input.clone(), cancel)
-                                    .await,
-                                started_after_ms,
-                                duration_ms: started.elapsed().as_millis() as u64,
-                            },
-                        )
-                    }
-                })
-                .collect();
-            for (idx, output) in futures_util::future::join_all(futures).await {
-                outputs[idx] = Some(output);
-            }
-        }
-
-        // Phase 2: everything not yet run, in order.
         for (idx, (_, name, input)) in tool_uses.iter().enumerate() {
             if outputs[idx].is_some() {
                 continue;
@@ -1638,7 +1595,63 @@ impl Engine {
             }
 
             let is_read_only = self.tools.is_read_only(name);
-            let perm = self.decide_permission(name, input, is_read_only).await;
+            let perm = match pending_permission.take() {
+                Some(permission) => permission,
+                None => self.decide_permission(name, input, is_read_only).await,
+            };
+
+            if is_read_only && matches!(perm, PermissionResult::Allow) {
+                let mut end = idx + 1;
+                while end < tool_uses.len() && end - idx < MAX_PARALLEL_TOOLS {
+                    let (_, next_name, next_input) = &tool_uses[end];
+                    if !self.tools.is_read_only(next_name)
+                        || cancel.is_cancelled()
+                        || self.steering_pending()
+                    {
+                        break;
+                    }
+                    let permission = self.decide_permission(next_name, next_input, true).await;
+                    if !matches!(permission, PermissionResult::Allow) {
+                        pending_permission = Some(permission);
+                        break;
+                    }
+                    end += 1;
+                }
+
+                let this: &Self = &*self;
+                let futures = tool_uses[idx..end]
+                    .iter()
+                    .map(|(_, name, input)| async move {
+                        let started_after_ms = this.trace_offset_ms();
+                        let started = Instant::now();
+                        let output = if cancel.is_cancelled() || this.steering_pending() {
+                            crate::tools::ToolOutput {
+                                content: if cancel.is_cancelled() {
+                                    Self::INTERRUPTED_BY_USER
+                                } else {
+                                    Self::SKIPPED_FOR_STEERING
+                                }
+                                .to_string(),
+                                is_error: true,
+                            }
+                        } else {
+                            this.execute_tool_steerable(name, input.clone(), cancel)
+                                .await
+                        };
+                        TimedToolOutput {
+                            output,
+                            started_after_ms,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        }
+                    });
+                for (slot, output) in outputs[idx..end]
+                    .iter_mut()
+                    .zip(futures_util::future::join_all(futures).await)
+                {
+                    *slot = Some(output);
+                }
+                continue;
+            }
 
             let started_after_ms = self.trace_offset_ms();
             let started = Instant::now();
@@ -1679,7 +1692,7 @@ impl Engine {
             interrupted = true;
         }
 
-        // Phase 3: truncate, emit events, and build blocks in order.
+        // Truncate, emit events, and build blocks in order.
         let mut result_blocks = Vec::with_capacity(tool_uses.len());
         for (idx, (id, name, input)) in tool_uses.iter().enumerate() {
             let timed = outputs[idx].take().expect("every tool got an output");
@@ -3054,6 +3067,157 @@ mod tests {
                 let expected_id = format!("test{}", i + 1);
                 assert_eq!(tool_use_id, &expected_id, "Results should maintain order");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_batch_reads_observe_preceding_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordered.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut engine = Engine::for_tests(
+            Box::new(MockProvider),
+            SteeringQueue::default(),
+            PermissionMode::Bypass,
+        );
+        let calls = vec![
+            (
+                "before".into(),
+                "Read".into(),
+                serde_json::json!({"file_path": path}),
+            ),
+            (
+                "write".into(),
+                "Write".into(),
+                serde_json::json!({"file_path": path, "content": "after"}),
+            ),
+            (
+                "after".into(),
+                "Read".into(),
+                serde_json::json!({"file_path": path}),
+            ),
+            (
+                "write-again".into(),
+                "Write".into(),
+                serde_json::json!({"file_path": path, "content": "final"}),
+            ),
+            (
+                "final".into(),
+                "Read".into(),
+                serde_json::json!({"file_path": path}),
+            ),
+        ];
+        let (tx, _rx) = mpsc::channel(64);
+        let (results, interrupted) = engine
+            .execute_tool_batch(
+                &calls,
+                &tx,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(!interrupted);
+        for (index, expected) in [(0, "before"), (2, "after"), (4, "final")] {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = &results[index]
+            else {
+                panic!("expected tool result");
+            };
+            assert_eq!(tool_use_id, expected);
+            assert_ne!(*is_error, Some(true));
+            assert!(
+                content.contains(expected),
+                "{content:?} should contain {expected}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "final");
+    }
+
+    struct ConcurrencyProbe {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ConcurrencyProbe {
+        fn name(&self) -> &str {
+            "ConcurrencyProbe"
+        }
+        fn description(&self) -> &str {
+            "Measure concurrent calls"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::tools::ToolOutput> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolOutput {
+                content: input.to_string(),
+                is_error: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_batch_parallelism_is_bounded_and_results_stay_ordered() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut engine = Engine::for_tests(
+            Box::new(MockProvider),
+            SteeringQueue::default(),
+            PermissionMode::Bypass,
+        );
+        engine.tools.add_tools(vec![Box::new(ConcurrencyProbe {
+            active: active.clone(),
+            peak: peak.clone(),
+        })]);
+        let calls: Vec<_> = (0..MAX_PARALLEL_TOOLS * 2 + 1)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    "ConcurrencyProbe".into(),
+                    serde_json::json!({"index": i}),
+                )
+            })
+            .collect();
+        let (tx, _rx) = mpsc::channel(64);
+        let (results, interrupted) = engine
+            .execute_tool_batch(
+                &calls,
+                &tx,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(!interrupted);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_PARALLEL_TOOLS);
+        assert_eq!(results.len(), calls.len());
+        for (index, result) in results.iter().enumerate() {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = result
+            else {
+                panic!("expected tool result");
+            };
+            assert_eq!(tool_use_id, &index.to_string());
+            assert_eq!(content, &calls[index].2.to_string());
+            assert_ne!(*is_error, Some(true));
         }
     }
 
