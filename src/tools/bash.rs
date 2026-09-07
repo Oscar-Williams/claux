@@ -16,6 +16,10 @@ use super::{Tool, ToolOutput};
 use crate::command_sandbox::CommandSandbox;
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Bytes of each stream retained in memory. Anything past this is drained
+/// and counted, never stored, so a runaway command cannot exhaust memory
+/// before the tool result is truncated for the model.
+const OUTPUT_CAPTURE_LIMIT: usize = 1024 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -118,20 +122,19 @@ impl Tool for BashTool {
         let mut stderr_pipe = child.stderr().take();
 
         // Spawn readers so partial output is captured even if we get cancelled
-        // or time out mid-stream.
+        // or time out mid-stream. Each keeps at most OUTPUT_CAPTURE_LIMIT
+        // bytes and keeps draining so the child never blocks on a full pipe.
         let mut stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(p) = stdout_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf).await;
+            match stdout_pipe.as_mut() {
+                Some(p) => read_bounded(p).await,
+                None => Captured::default(),
             }
-            buf
         });
         let mut stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(p) = stderr_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf).await;
+            match stderr_pipe.as_mut() {
+                Some(p) => read_bounded(p).await,
+                None => Captured::default(),
             }
-            buf
         });
 
         let outcome = tokio::select! {
@@ -154,9 +157,10 @@ impl Tool for BashTool {
         let (stdout, stdout_abandoned) = drain_reader(&mut stdout_task).await;
         let (stderr, stderr_abandoned) = drain_reader(&mut stderr_task).await;
         let output_abandoned = stdout_abandoned || stderr_abandoned;
+        let dropped_bytes = stdout.dropped + stderr.dropped;
 
-        let stdout_s = render_output(&stdout, "stdout");
-        let stderr_s = render_output(&stderr, "stderr");
+        let stdout_s = render_output(&stdout.bytes, "stdout");
+        let stderr_s = render_output(&stderr.bytes, "stderr");
 
         let mut content = String::new();
         if !stdout_s.is_empty() {
@@ -225,6 +229,12 @@ impl Tool for BashTool {
             content.truncate(100_000);
             content.push_str("\n... (output truncated)");
         }
+        // After the model-facing truncation so the note itself survives.
+        if dropped_bytes > 0 {
+            content.push_str(&format!(
+                "\n... ({dropped_bytes} bytes of output beyond the capture limit were not retained)"
+            ));
+        }
 
         Ok(ToolOutput { content, is_error })
     }
@@ -262,13 +272,37 @@ fn terminate_process_tree(
     child.start_kill().is_ok()
 }
 
-async fn drain_reader(task: &mut JoinHandle<Vec<u8>>) -> (Vec<u8>, bool) {
+/// Output retained from one stream plus how many bytes were drained past
+/// the capture limit.
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    dropped: u64,
+}
+
+/// Read a stream to EOF, retaining at most OUTPUT_CAPTURE_LIMIT bytes.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Captured {
+    let mut captured = Captured::default();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return captured,
+            Ok(read) => read,
+        };
+        let room = OUTPUT_CAPTURE_LIMIT.saturating_sub(captured.bytes.len());
+        let keep = read.min(room);
+        captured.bytes.extend_from_slice(&chunk[..keep]);
+        captured.dropped += (read - keep) as u64;
+    }
+}
+
+async fn drain_reader(task: &mut JoinHandle<Captured>) -> (Captured, bool) {
     match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut *task).await {
         Ok(Ok(output)) => (output, false),
-        Ok(Err(_)) => (Vec::new(), false),
+        Ok(Err(_)) => (Captured::default(), false),
         Err(_) => {
             task.abort();
-            (Vec::new(), true)
+            (Captured::default(), true)
         }
     }
 }
@@ -307,6 +341,35 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.trim().contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn bash_output_beyond_the_capture_limit_is_drained_not_stored() {
+        let tool = tool();
+        // 8 MiB of output: far beyond the 1 MiB capture limit and the
+        // 100 KB model-facing truncation. The command must finish (the pipe
+        // is drained), the result must stay bounded, and the drop must be
+        // reported.
+        let result = tool
+            .execute(
+                json!({"command": "head -c 8388608 /dev/zero | tr '\\0' 'x'"}),
+                token(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.content.len() <= 100_000 + 160,
+            "{}",
+            result.content.len()
+        );
+        assert!(
+            result
+                .content
+                .contains("bytes of output beyond the capture limit were not retained"),
+            "{}",
+            &result.content[result.content.len().saturating_sub(200)..]
+        );
+        assert!(!result.content.contains("timed out"));
     }
 
     #[tokio::test]
