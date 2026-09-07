@@ -276,7 +276,8 @@ pub async fn run(
                                 }
                                 println!("\n  \x1b[2m[{n}]\x1b[0m");
                             }
-                            StreamEvent::ContextUsage(_) => {}
+                            StreamEvent::ContextUsage(_) | StreamEvent::ModelRequest | StreamEvent::Reasoning => {}
+                            StreamEvent::ToolRunning { .. } | StreamEvent::ToolFinished { .. } => {}
                             StreamEvent::Retry(n) => {
                                 if in_tool {
                                     println!();

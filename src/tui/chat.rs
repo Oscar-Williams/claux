@@ -35,6 +35,7 @@ pub enum ChatMessage {
 /// Status of a tool invocation in the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolStatus {
+    Queued,
     Running,
     Success,
     Error,
@@ -48,8 +49,15 @@ pub enum Mode {
     Permission,
 }
 
+pub struct Activity {
+    pub label: String,
+    pub started: std::time::Instant,
+    pub updated: std::time::Instant,
+}
+
 /// Chat screen state.
 pub struct ChatApp {
+    pub activity: Option<Activity>,
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
@@ -90,6 +98,7 @@ pub struct ChatApp {
 impl ChatApp {
     pub fn new(model: &str, theme: Theme) -> Self {
         Self {
+            activity: None,
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -122,6 +131,51 @@ impl ChatApp {
             role: crate::utils::sanitize_terminal_text(role),
             content: crate::utils::sanitize_terminal_text(content),
         });
+    }
+
+    pub fn set_activity(&mut self, label: &str) {
+        let now = std::time::Instant::now();
+        if let Some(activity) = &mut self.activity {
+            if activity.label == label {
+                activity.updated = now;
+                return;
+            }
+        }
+        self.activity = Some(Activity {
+            label: crate::utils::sanitize_terminal_text(label),
+            started: now,
+            updated: now,
+        });
+    }
+
+    fn refresh_tool_activity(&mut self, indices: &[usize]) {
+        let running: Vec<_> = indices
+            .iter()
+            .filter_map(|&idx| match self.messages.get(idx) {
+                Some(ChatMessage::Tool {
+                    name,
+                    status: ToolStatus::Running,
+                    ..
+                }) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let queued = indices.iter().any(|&idx| {
+            matches!(
+                self.messages.get(idx),
+                Some(ChatMessage::Tool {
+                    status: ToolStatus::Queued,
+                    ..
+                })
+            )
+        });
+        let label = match running.as_slice() {
+            [] if queued => "Tools queued; waiting to start".to_string(),
+            [] => "Waiting for next update".to_string(),
+            [name] => format!("Running {name}"),
+            _ => format!("Running {} tools", running.len()),
+        };
+        self.set_activity(&label);
     }
 
     #[cfg(test)]
@@ -480,7 +534,7 @@ pub async fn run(
             app.scroll = 0;
             app.manual_scroll = false;
 
-            app.status = format!("{} | {} | thinking...", app.model, engine.context_status());
+            app.status = format!("{} | {}", app.model, engine.context_status());
 
             let submit_result =
                 drive_streaming(engine, &trimmed, &mut app, terminal, &mut CrosstermKeys).await;
@@ -561,6 +615,7 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     keys: &mut dyn KeySource,
 ) -> Result<()> {
+    app.set_activity("Waiting for model response");
     let steering = engine.steering_queue();
     let steer_buf = app.steer_buf.clone();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -576,6 +631,7 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
         // emits results in tool_use order).
         let mut running_tools: std::collections::VecDeque<usize> =
             std::collections::VecDeque::new();
+        let mut batch_tools = Vec::new();
 
         // First tick after one period, not immediately: keys and draws
         // shouldn't race the event stream at t=0.
@@ -594,14 +650,25 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                     let Some(event) = event else {
                         break; // tx dropped: turn over, events drained
                     };
+                    if let Some(activity) = &mut app.activity {
+                        activity.updated = std::time::Instant::now();
+                    }
                     match event {
+                        StreamEvent::ModelRequest => {
+                            app.set_activity("Waiting for model response");
+                        }
+                        StreamEvent::Reasoning => {
+                            app.set_activity("Model reasoning");
+                        }
                         StreamEvent::Text(t) => {
+                            app.set_activity("Receiving model response");
                             // Drawn by the tick, which coalesces chunks
                             app.stream_buffer
                                 .push_str(&crate::utils::sanitize_terminal_text(&t));
                             app.thinking = false;
                         }
                         StreamEvent::Retry(n) => {
+                            app.set_activity("Waiting for model retry");
                             // The rejected provider attempt is not part of
                             // conversation history, and its text has not been
                             // flushed: the engine only emits Retry for an
@@ -614,12 +681,13 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                             app.add_message("system", &n);
                         }
                         StreamEvent::Notice(n) => {
+                            app.set_activity("Processing context");
                             flush_stream_buffer(app);
                             app.add_message("system", &n);
                         }
                         StreamEvent::ContextUsage(usage) => {
                             app.status = format!(
-                                "{} | {} | thinking...",
+                                "{} | {}",
                                 app.model,
                                 usage.short_status()
                             );
@@ -629,15 +697,33 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                             app.add_message("user", &t);
                         }
                         StreamEvent::ToolStart { name, summary, input } => {
+                            if running_tools.is_empty() {
+                                batch_tools.clear();
+                            }
                             flush_stream_buffer(app);
                             app.add_tool_with_input(
                                 &name,
                                 &summary,
                                 &input,
-                                ToolStatus::Running,
+                                ToolStatus::Queued,
                             );
                             running_tools.push_back(app.messages.len() - 1);
+                            batch_tools.push(app.messages.len() - 1);
+                            app.refresh_tool_activity(&batch_tools);
                             terminal.draw(|f| ui::draw_chat(f, app))?;
+                        }
+                        StreamEvent::ToolRunning { index } => {
+                            app.activity = None;
+                            if let Some(&idx) = batch_tools.get(index) {
+                                app.set_tool_status_at(idx, ToolStatus::Running);
+                            }
+                            app.refresh_tool_activity(&batch_tools);
+                        }
+                        StreamEvent::ToolFinished { index, is_error } => {
+                            if let Some(&idx) = batch_tools.get(index) {
+                                app.set_tool_status_at(idx, if is_error { ToolStatus::Error } else { ToolStatus::Success });
+                            }
+                            app.refresh_tool_activity(&batch_tools);
                         }
                         StreamEvent::ToolResult { is_error, .. } => {
                             if let Some(idx) = running_tools.pop_front() {
@@ -646,6 +732,7 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                                     if is_error { ToolStatus::Error } else { ToolStatus::Success },
                                 );
                             }
+                            app.refresh_tool_activity(&batch_tools);
                             terminal.draw(|f| ui::draw_chat(f, app))?;
                         }
                         StreamEvent::PermissionRequest { tool_name, summary, input, respond }
@@ -679,6 +766,9 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                             app.add_message("system", "Interrupted by user.");
                         }
                         StreamEvent::Error(_) => {
+                            while let Some(idx) = running_tools.pop_front() {
+                                app.set_tool_status_at(idx, ToolStatus::Error);
+                            }
                             // Surfaced through submit_result by the caller
                         }
                         StreamEvent::Done => {
@@ -689,6 +779,7 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                 _ = tick.tick() => {
                     if poll_stream_key(keys, &steer_buf, &steering)? {
                         cancel.cancel();
+                        app.set_activity("Interrupting");
                     }
                     // The tick is the only draw during streaming: it
                     // coalesces all chunks since the last frame, animates
@@ -699,6 +790,7 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
         }
     }
 
+    app.activity = None;
     submit_result.unwrap_or(Ok(()))
 }
 
@@ -1676,6 +1768,18 @@ mod tuishot_shots {
         Streaming,
 
         #[tuishot(
+            name = "chat-tool-running",
+            description = "Silent Bash execution with elapsed and quiet time"
+        )]
+        ToolRunning,
+
+        #[tuishot(
+            name = "chat-tool-queued",
+            description = "Tool announced but not executing yet"
+        )]
+        ToolQueued,
+
+        #[tuishot(
             name = "chat-permission",
             description = "Prompting for Bash permission"
         )]
@@ -1687,6 +1791,7 @@ mod tuishot_shots {
 
     impl ChatShotRender for ChatShot {
         fn render(&self, buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+            let now = std::time::Instant::now();
             let theme = crate::theme::Theme::dark();
             let mut app = match self {
                 ChatShot::Conversation => sample_conversation(),
@@ -1712,6 +1817,36 @@ mod tuishot_shots {
                     ]);
                     app
                 }
+                ChatShot::ToolRunning | ChatShot::ToolQueued => {
+                    let mut app = sample_conversation();
+                    app.mode = Mode::Streaming;
+                    let running = matches!(self, ChatShot::ToolRunning);
+                    app.add_tool_with_input(
+                        "Bash",
+                        "",
+                        &serde_json::json!({
+                            "command": "rg -n cloud-hosting ~/dev",
+                            "description": "Find cloud-hosting references across repos"
+                        }),
+                        if running {
+                            ToolStatus::Running
+                        } else {
+                            ToolStatus::Queued
+                        },
+                    );
+                    let started = now - std::time::Duration::from_secs(45);
+                    app.activity = Some(Activity {
+                        label: if running {
+                            "Running Bash"
+                        } else {
+                            "Tools queued; waiting to start"
+                        }
+                        .to_string(),
+                        started,
+                        updated: started,
+                    });
+                    app
+                }
                 ChatShot::Empty => {
                     let mut app = ChatApp::new("claude-sonnet-4-20250514", theme);
                     app.version = SNAPSHOT_VERSION.to_string();
@@ -1719,7 +1854,7 @@ mod tuishot_shots {
                 }
             };
             let rendered = tuishot::render_to_buffer(area.width, area.height, |f| {
-                ui::draw_chat(f, &mut app);
+                ui::draw_chat_at(f, &mut app, now);
             });
             buf.clone_from(&rendered);
         }

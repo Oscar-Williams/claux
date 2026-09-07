@@ -199,6 +199,9 @@ struct TimedToolOutput {
 
 /// Events sent from the engine to the UI during streaming.
 pub enum StreamEvent {
+    ModelRequest,
+    /// Provider reasoning activity without exposing its private content.
+    Reasoning,
     Text(String),
     /// The current provider attempt was rejected before any tools ran.
     /// UIs must discard uncommitted text from that attempt before showing
@@ -220,6 +223,15 @@ pub enum StreamEvent {
         input: serde_json::Value,
     },
     ToolResult {
+        is_error: bool,
+    },
+    /// Live execution updates, indexed within the announced tool batch.
+    /// ToolResult remains ordered for transcript consumers.
+    ToolRunning {
+        index: usize,
+    },
+    ToolFinished {
+        index: usize,
         is_error: bool,
     },
     /// Permission prompt — UI must respond via the oneshot sender.
@@ -1087,6 +1099,7 @@ impl Engine {
                 .map(|prompt| format!("{}\n\n{prompt}", self.system_prompt));
             let model_started_after_ms = self.trace_offset_ms();
             let model_started = Instant::now();
+            let _ = tx.send(StreamEvent::ModelRequest).await;
             let stream_result = self
                 .provider
                 .stream(
@@ -1227,6 +1240,7 @@ impl Engine {
                         text_buf.push_str(&t);
                     }
                     ApiEvent::Reasoning { text, details } => {
+                        let _ = tx.send(StreamEvent::Reasoning).await;
                         if let Some(text) = text {
                             reasoning_text.push_str(&text);
                         }
@@ -1592,9 +1606,8 @@ impl Engine {
                 }
 
                 let this: &Self = &*self;
-                let futures = tool_uses[idx..end]
-                    .iter()
-                    .map(|(_, name, input)| async move {
+                let futures = tool_uses[idx..end].iter().enumerate().map(
+                    |(offset, (_, name, input))| async move {
                         let started_after_ms = this.trace_offset_ms();
                         let started = Instant::now();
                         let output = if cancel.is_cancelled() || this.steering_pending() {
@@ -1608,7 +1621,7 @@ impl Engine {
                                 is_error: true,
                             }
                         } else {
-                            this.execute_tool_steerable(name, input.clone(), cancel)
+                            this.execute_tool_reporting(idx + offset, name, input, tx, cancel)
                                 .await
                         };
                         TimedToolOutput {
@@ -1616,7 +1629,8 @@ impl Engine {
                             started_after_ms,
                             duration_ms: started.elapsed().as_millis() as u64,
                         }
-                    });
+                    },
+                );
                 for (slot, output) in outputs[idx..end]
                     .iter_mut()
                     .zip(futures_util::future::join_all(futures).await)
@@ -1630,7 +1644,7 @@ impl Engine {
             let started = Instant::now();
             let output = match perm {
                 PermissionResult::Allow => {
-                    self.execute_tool_steerable(name, input.clone(), cancel)
+                    self.execute_tool_reporting(idx, name, input, tx, cancel)
                         .await
                 }
                 PermissionResult::Deny(reason) => crate::tools::ToolOutput {
@@ -1649,7 +1663,7 @@ impl Engine {
                             is_error: true,
                         }
                     } else {
-                        self.ask_permission(name, input, message, diff, tx, cancel)
+                        self.ask_permission(name, input, message, diff, (idx, tx), cancel)
                             .await
                     }
                 }
@@ -1752,15 +1766,37 @@ impl Engine {
         crate::permissions::apply_hook_verdicts(tool_name, input, result, &verdicts)
     }
 
+    async fn execute_tool_reporting(
+        &self,
+        index: usize,
+        name: &str,
+        input: &serde_json::Value,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> crate::tools::ToolOutput {
+        let _ = tx.send(StreamEvent::ToolRunning { index }).await;
+        let output = self
+            .execute_tool_steerable(name, input.clone(), cancel)
+            .await;
+        let _ = tx
+            .send(StreamEvent::ToolFinished {
+                index,
+                is_error: output.is_error,
+            })
+            .await;
+        output
+    }
+
     async fn ask_permission(
         &mut self,
         name: &str,
         input: &serde_json::Value,
         message: String,
         diff: Option<String>,
-        tx: &mpsc::Sender<StreamEvent>,
+        progress: (usize, &mpsc::Sender<StreamEvent>),
         cancel: &tokio_util::sync::CancellationToken,
     ) -> crate::tools::ToolOutput {
+        let (index, tx) = progress;
         self.fire_hook(&HookTrigger::OnPermissionRequest).await;
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -1796,7 +1832,7 @@ impl Engine {
 
         match response {
             Ok(PermissionResponse::Allow) => {
-                self.execute_tool_steerable(name, input.clone(), cancel)
+                self.execute_tool_reporting(index, name, input, tx, cancel)
                     .await
             }
             Ok(PermissionResponse::AlwaysAllow) => {
@@ -1807,12 +1843,12 @@ impl Engine {
                     }
                     _ => {}
                 }
-                self.execute_tool_steerable(name, input.clone(), cancel)
+                self.execute_tool_reporting(index, name, input, tx, cancel)
                     .await
             }
             Ok(PermissionResponse::AlwaysAllowCommand(ref cmd)) => {
                 self.permissions.always_allow_command(cmd);
-                self.execute_tool_steerable(name, input.clone(), cancel)
+                self.execute_tool_reporting(index, name, input, tx, cancel)
                     .await
             }
             // DenyAndCancel queues the typed message as steering; the
@@ -4259,12 +4295,74 @@ mod tests {
                 &serde_json::json!({"file_path": "/tmp/x", "content": "x"}),
                 "write /tmp/x".to_string(),
                 None,
-                &tx,
+                (0, &tx),
                 &cancel,
             )
             .await;
 
         assert!(output.is_error);
         assert!(output.content.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn tool_completion_is_visible_before_a_later_permission_wait() {
+        let mut engine = Engine::for_tests(
+            Box::new(MockProvider),
+            SteeringQueue::default(),
+            PermissionMode::Default,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let tools = vec![
+            (
+                "read".to_string(),
+                "Glob".to_string(),
+                serde_json::json!({"pattern": "*.missing", "path": dir.path()}),
+            ),
+            (
+                "bash".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo approved"}),
+            ),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let batch = engine.execute_tool_batch(&tools, &tx, true, &cancel);
+        let observer = async {
+            let mut running = Vec::new();
+            let mut finished = Vec::new();
+            let mut results = 0;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::ToolRunning { index } => running.push(index),
+                    StreamEvent::ToolFinished { index, is_error } => {
+                        assert!(!is_error);
+                        finished.push(index);
+                    }
+                    StreamEvent::PermissionRequest { respond, .. } => {
+                        assert_eq!(running, vec![0]);
+                        assert_eq!(finished, vec![0]);
+                        assert_eq!(results, 0, "ordered results wait for the batch");
+                        respond.send(PermissionResponse::Allow).unwrap();
+                    }
+                    StreamEvent::ToolResult { .. } => {
+                        results += 1;
+                        if results == 2 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(running, vec![0, 1]);
+            assert_eq!(finished, vec![0, 1]);
+        };
+        let ((blocks, interrupted), ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(batch, observer)
+            })
+            .await
+            .expect("execution updates must not wait for the full batch");
+        assert!(!interrupted);
+        assert_eq!(blocks.len(), 2);
     }
 }

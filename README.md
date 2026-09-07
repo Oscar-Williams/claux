@@ -24,6 +24,7 @@ A terminal-based AI coding assistant written in Rust. Streams responses, execute
 - **Prompt caching** — automatic Anthropic cache breakpoints on the system prompt and conversation, cutting input cost and latency on long sessions
 - **Context assembly** — git status, CLAUDE.md, environment info in system prompt. Checked-in CLAUDE.md is loaded only for trusted projects (the user's `~/.claude/CLAUDE.md` always is), and each file is size-capped
 - **TUI mode** — full-screen ratatui interface with `--tui`
+- **Visible activity**: the input border shows whether the model is responding, tools are queued, or a tool is executing, with elapsed time and a notice after ten seconds without updates. Tool completions appear as they happen, even while other tools in the batch are pending. The animation shows that the UI is responsive; Bash output is still collected until the command finishes. Ctrl+C interrupts a silent turn.
 - **Multi-provider** — Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint
 - **Native system prompt** — claux speaks as claux; the full prompt is readable in `src/context.rs`, and what you read is what the model gets
 - **Markdown rendering** — code blocks, bold, headers in the TUI

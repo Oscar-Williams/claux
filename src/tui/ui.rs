@@ -39,6 +39,10 @@ fn count_line_rows(line: &Line<'static>, width: u16) -> u16 {
 
 /// Draw the chat screen.
 pub fn draw_chat(f: &mut Frame, app: &mut ChatApp) {
+    draw_chat_at(f, app, std::time::Instant::now());
+}
+
+pub(super) fn draw_chat_at(f: &mut Frame, app: &mut ChatApp, now: std::time::Instant) {
     let input_height = if app.permission_details.is_some() {
         let detail_lines = app
             .permission_details
@@ -220,7 +224,7 @@ pub fn draw_chat(f: &mut Frame, app: &mut ChatApp) {
         .scroll((local_offset, 0));
     f.render_widget(messages_widget, msg_area);
 
-    draw_input_and_status(f, app, &chunks);
+    draw_input_and_status(f, app, &chunks, now);
 }
 
 /// Render `app.messages` into styled lines. Called only on cache misses.
@@ -321,6 +325,7 @@ fn history_lines(app: &ChatApp) -> Vec<Line<'static>> {
                 status,
             } => {
                 let (indicator, indicator_color) = match status {
+                    ToolStatus::Queued => ("◷", app.theme.dim),
                     ToolStatus::Running => ("⟳", app.theme.warning),
                     ToolStatus::Success => ("●", app.theme.tool_success),
                     ToolStatus::Error => ("✗", app.theme.tool_error),
@@ -443,7 +448,12 @@ fn draw_completion_popup(f: &mut Frame, app: &mut ChatApp, input_area: ratatui::
 }
 
 /// Draw the input (or permission) box and the status bar.
-fn draw_input_and_status(f: &mut Frame, app: &mut ChatApp, chunks: &[ratatui::layout::Rect]) {
+fn draw_input_and_status(
+    f: &mut Frame,
+    app: &mut ChatApp,
+    chunks: &[ratatui::layout::Rect],
+    now: std::time::Instant,
+) {
     // Input area
     if let (Some(ref prompt), Some(ref details)) = (&app.permission_prompt, &app.permission_details)
     {
@@ -519,10 +529,16 @@ fn draw_input_and_status(f: &mut Frame, app: &mut ChatApp, chunks: &[ratatui::la
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(if app.mode == Mode::Input {
                         app.theme.user
+                    } else if let Some(activity) = &app.activity {
+                        if now.saturating_duration_since(activity.updated).as_secs() >= 10 {
+                            app.theme.warning
+                        } else {
+                            app.theme.assistant
+                        }
                     } else {
                         app.theme.dim
                     }))
-                    .title(" > "),
+                    .title(activity_title(app, now)),
             )
             .scroll((vertical_scroll as u16, 0));
         f.render_widget(input_widget, chunks[2]);
@@ -557,6 +573,28 @@ fn draw_input_and_status(f: &mut Frame, app: &mut ChatApp, chunks: &[ratatui::la
     f.render_widget(status, chunks[3]);
 }
 
+fn activity_title(app: &ChatApp, now: std::time::Instant) -> String {
+    let Some(activity) = &app.activity else {
+        return " > ".to_string();
+    };
+    let elapsed = now.saturating_duration_since(activity.started);
+    let quiet = now.saturating_duration_since(activity.updated).as_secs();
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = (elapsed.as_millis() / 100) as usize % spinner.len();
+    let silence = if quiet >= 10 {
+        format!(" · no updates for {quiet}s")
+    } else {
+        String::new()
+    };
+    format!(
+        " {} {} · {}s{} ",
+        spinner[frame],
+        activity.label,
+        elapsed.as_secs(),
+        silence
+    )
+}
+
 fn editor_text(app: &ChatApp) -> String {
     if app.mode == Mode::Streaming {
         let steer = app.steer_buf.lock().expect("steer buffer poisoned");
@@ -574,6 +612,37 @@ fn editor_text(app: &ChatApp) -> String {
 mod perf_probe {
     use super::*;
     use crate::theme::Theme;
+
+    #[test]
+    fn activity_shows_elapsed_and_quiet_time_without_claiming_progress() {
+        let mut app = ChatApp::new("test-model", Theme::dark());
+        app.set_activity("Running Bash");
+        let start = app.activity.as_ref().unwrap().started;
+        let title = activity_title(&app, start + std::time::Duration::from_secs(45));
+        assert!(title.contains("Running Bash · 45s · no updates for 45s"));
+        assert_ne!(
+            activity_title(&app, start),
+            activity_title(&app, start + std::time::Duration::from_millis(100))
+        );
+
+        app.activity.as_mut().unwrap().updated = start + std::time::Duration::from_secs(44);
+        let title = activity_title(&app, start + std::time::Duration::from_secs(45));
+        assert!(title.contains("Running Bash · 45s"));
+        assert!(!title.contains("no updates"));
+        app.activity = None;
+        assert_eq!(activity_title(&app, start), " > ");
+    }
+
+    #[test]
+    fn queued_tools_are_distinct_from_running_tools() {
+        let mut app = ChatApp::new("test-model", Theme::dark());
+        app.add_tool("Bash", "sleep 30", ToolStatus::Queued);
+        let queued = history_lines(&app);
+        assert_eq!(queued[0].spans[0].content, "◷ ");
+        app.set_tool_status_at(0, ToolStatus::Running);
+        let running = history_lines(&app);
+        assert_eq!(running[0].spans[0].content, "⟳ ");
+    }
 
     #[test]
     fn time_draw_with_large_history() {
