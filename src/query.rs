@@ -55,6 +55,10 @@ pub struct Engine {
     last_request_usage: Option<RequestUsageBaseline>,
     /// Short audit summary for the most recently completed compaction.
     last_compaction_notice: Option<String>,
+    /// Why the most recent turn failed, if it did.
+    last_failure: Option<FailureRecord>,
+    /// Base delay for transient-failure backoff; tests shrink it.
+    retry_backoff_base: std::time::Duration,
 }
 
 /// What the provider charged for the most recent request, and how much of the
@@ -94,8 +98,60 @@ pub struct ModelTraceEntry {
     pub started_after_ms: u64,
     pub duration_ms: u64,
     pub status: String,
+    /// Failure kind for `error` and `retry` rounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ApiFailureKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ModelRoundUsage>,
+}
+
+/// Why a turn ended in failure, in the terms consumers classify on.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct FailureRecord {
+    pub kind: ApiFailureKind,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// Provider attempts made for the failing request, including retries.
+    pub attempts: u32,
+}
+
+impl FailureRecord {
+    /// A turn ended by the user or a shutdown signal.
+    pub fn cancelled(attempts: u32) -> Self {
+        Self {
+            kind: ApiFailureKind::Cancelled,
+            retryable: false,
+            http_status: None,
+            retry_after_ms: None,
+            attempts,
+        }
+    }
+
+    /// An error the engine could not classify further.
+    pub fn unclassified() -> Self {
+        Self {
+            kind: ApiFailureKind::Other,
+            retryable: false,
+            http_status: None,
+            retry_after_ms: None,
+            attempts: 1,
+        }
+    }
+
+    fn from_failure(failure: &ApiFailure, attempts: u32) -> Self {
+        Self {
+            kind: failure.kind,
+            retryable: failure.kind.retryable(),
+            http_status: failure.http_status,
+            retry_after_ms: failure
+                .retry_after
+                .map(|duration| duration.as_millis() as u64),
+            attempts,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -276,6 +332,13 @@ pub enum Continuation {
     ResumeTask,
 }
 
+/// Transient provider failures (rate limits, 5xx, transport) are reissued
+/// this many times with exponential backoff before the turn fails.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+const DEFAULT_RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Engine {
     pub fn new(
         provider: Box<dyn Provider>,
@@ -308,6 +371,8 @@ impl Engine {
             cost: CostTracker::new(model),
             last_request_usage: None,
             last_compaction_notice: None,
+            last_failure: None,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         }
     }
 
@@ -344,6 +409,8 @@ impl Engine {
             cost: CostTracker::new("test"),
             last_request_usage: None,
             last_compaction_notice: None,
+            last_failure: None,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         }
     }
 
@@ -500,6 +567,55 @@ impl Engine {
 
     pub fn set_max_tokens(&mut self, max_tokens: u32) {
         self.max_tokens = max_tokens.max(1);
+    }
+
+    /// The classified failure that ended the most recent turn, if any.
+    pub fn last_failure(&self) -> Option<&FailureRecord> {
+        self.last_failure.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_retry_backoff_base(&mut self, base: std::time::Duration) {
+        self.retry_backoff_base = base;
+    }
+
+    /// Delay before the next transient retry: the provider's Retry-After
+    /// when it sent one (capped), otherwise exponential backoff with jitter.
+    fn retry_delay(
+        &self,
+        attempt: u32,
+        retry_after: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        if let Some(retry_after) = retry_after {
+            return retry_after.min(MAX_RETRY_AFTER);
+        }
+        let exponent = attempt.saturating_sub(1).min(16);
+        let base = self
+            .retry_backoff_base
+            .saturating_mul(1u32 << exponent)
+            .min(MAX_RETRY_BACKOFF);
+        // Up to 25% jitter so parallel clients do not retry in lockstep.
+        let jitter_permille = (uuid::Uuid::new_v4().as_u128() % 251) as u32;
+        base + base.mul_f64(jitter_permille as f64 / 1000.0)
+    }
+
+    /// Sleep before a retry, returning false if cancelled first.
+    async fn wait_before_retry(
+        delay: std::time::Duration,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = cancel.cancelled() => false,
+        }
+    }
+
+    fn failure_of(error: &anyhow::Error) -> Option<ApiFailure> {
+        error.downcast_ref::<ApiFailure>().cloned()
+    }
+
+    fn record_failure(&mut self, failure: &ApiFailure, attempts: u32) {
+        self.last_failure = Some(FailureRecord::from_failure(failure, attempts));
     }
 
     pub fn set_model_metadata(&mut self, metadata: crate::model::ModelMetadata) {
@@ -1090,8 +1206,10 @@ impl Engine {
         self.messages.push(user_message);
         self.checkpoint_transcript();
 
+        self.last_failure = None;
         let mut recovery_attempts = 0;
         const MAX_RECOVERY: u32 = 3;
+        let mut transient_attempts: u32 = 0;
         let mut malformed_tool_retries = 0;
         const MAX_MALFORMED_TOOL_RETRIES: u32 = 1;
         let mut retry_prompt: Option<String> = None;
@@ -1149,17 +1267,40 @@ impl Engine {
             let mut rx = match stream_result {
                 Ok(rx) => rx,
                 Err(e) => {
+                    let failure = Self::failure_of(&e);
+                    let kind = failure.as_ref().map(|f| f.kind);
+                    let transient = failure.as_ref().is_some_and(|f| f.kind.retryable())
+                        && transient_attempts < MAX_TRANSIENT_RETRIES
+                        && !cancel.is_cancelled();
                     self.model_trace.push(ModelTraceEntry {
                         index: self.model_trace.len() + 1,
                         started_after_ms: model_started_after_ms,
                         duration_ms: model_started.elapsed().as_millis() as u64,
-                        status: "error".to_string(),
+                        status: if transient { "retry" } else { "error" }.to_string(),
+                        failure: kind,
                         usage: None,
                     });
                     self.checkpoint_transcript();
                     if cancel.is_cancelled() {
                         let _ = tx.send(StreamEvent::Interrupted).await;
                         return Ok(());
+                    }
+                    if transient {
+                        let failure = failure.expect("transient implies a classified failure");
+                        transient_attempts += 1;
+                        let delay = self.retry_delay(transient_attempts, failure.retry_after);
+                        let _ = tx
+                            .send(StreamEvent::Retry(format!(
+                                "provider {}; retrying in {:.0}s (attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES})",
+                                failure.kind.as_str().replace('_', " "),
+                                delay.as_secs_f64()
+                            )))
+                            .await;
+                        if !Self::wait_before_retry(delay, &cancel).await {
+                            let _ = tx.send(StreamEvent::Interrupted).await;
+                            return Ok(());
+                        }
+                        continue;
                     }
                     let err_str = e.to_string();
                     match Self::failure_kind(&e) {
@@ -1219,6 +1360,9 @@ impl Engine {
                         }
                         _ => {}
                     }
+                    if let Some(failure) = &failure {
+                        self.record_failure(failure, transient_attempts + 1);
+                    }
                     let _ = tx.send(StreamEvent::Error(err_str.clone())).await;
                     return Err(e);
                 }
@@ -1238,6 +1382,8 @@ impl Engine {
             // Retry recovery is only safe before this flips.
             let mut committed = false;
             let mut model_status = "completed";
+            let mut model_failure: Option<ApiFailureKind> = None;
+            let mut pending_retry_delay: Option<std::time::Duration> = None;
             let mut model_usage = None;
 
             loop {
@@ -1245,17 +1391,20 @@ impl Engine {
                     event = rx.recv() => match event {
                         Some(event) => event,
                         None => {
-                            let error = "API stream ended without completion".to_string();
-                            let _ = tx.send(StreamEvent::Error(error.clone())).await;
+                            let failure =
+                                ApiFailure::protocol_error("API stream ended without completion");
+                            let _ = tx.send(StreamEvent::Error(failure.message.clone())).await;
                             self.model_trace.push(ModelTraceEntry {
                                 index: self.model_trace.len() + 1,
                                 started_after_ms: model_started_after_ms,
                                 duration_ms: model_started.elapsed().as_millis() as u64,
                                 status: "error".to_string(),
+                                failure: Some(failure.kind),
                                 usage: model_usage,
                             });
                             self.checkpoint_transcript();
-                            return Err(anyhow::anyhow!(error));
+                            self.record_failure(&failure, transient_attempts + 1);
+                            return Err(anyhow::Error::new(failure));
                         }
                     },
                     _ = cancel.cancelled() => {
@@ -1320,10 +1469,30 @@ impl Engine {
                         // recovery kind cannot be added without the guard.
                         if !committed {
                             match failure.kind {
+                                kind if kind.retryable()
+                                    && transient_attempts < MAX_TRANSIENT_RETRIES =>
+                                {
+                                    transient_attempts += 1;
+                                    let delay =
+                                        self.retry_delay(transient_attempts, failure.retry_after);
+                                    let _ = tx
+                                        .send(StreamEvent::Retry(format!(
+                                            "provider {}; retrying in {:.0}s (attempt {transient_attempts}/{MAX_TRANSIENT_RETRIES})",
+                                            kind.as_str().replace('_', " "),
+                                            delay.as_secs_f64()
+                                        )))
+                                        .await;
+                                    pending_retry_delay = Some(delay);
+                                    had_error = true;
+                                    model_status = "retry";
+                                    model_failure = Some(kind);
+                                    break;
+                                }
                                 ApiFailureKind::MalformedToolArguments
                                     if malformed_tool_retries < MAX_MALFORMED_TOOL_RETRIES =>
                                 {
                                     malformed_tool_retries += 1;
+                                    model_failure = Some(ApiFailureKind::MalformedToolArguments);
                                     retry_prompt =
                                         Some(Self::malformed_tool_retry_prompt(&failure.message));
                                     let _ = tx
@@ -1338,6 +1507,7 @@ impl Engine {
                                 }
                                 ApiFailureKind::OutputLimitExceeded if self.max_tokens < 64_000 => {
                                     self.max_tokens = (self.max_tokens * 2).min(64_000);
+                                    model_failure = Some(ApiFailureKind::OutputLimitExceeded);
                                     let _ = tx
                                         .send(StreamEvent::Retry(
                                             "provider hit the output limit; retrying with a larger budget"
@@ -1352,6 +1522,7 @@ impl Engine {
                                     if recovery_attempts < MAX_RECOVERY =>
                                 {
                                     recovery_attempts += 1;
+                                    model_failure = Some(ApiFailureKind::ContextExceeded);
                                     let _ = tx
                                         .send(StreamEvent::Retry(
                                             "provider rejected the context; compacting and retrying"
@@ -1392,15 +1563,20 @@ impl Engine {
                             started_after_ms: model_started_after_ms,
                             duration_ms: model_started.elapsed().as_millis() as u64,
                             status: "error".to_string(),
+                            failure: Some(failure.kind),
                             usage: model_usage,
                         });
                         self.checkpoint_transcript();
+                        self.record_failure(&failure, transient_attempts + 1);
                         // Keep the detail in the rendered message: `context`
                         // alone would leave `to_string()` as just "API error"
                         // and push the cause into the error source, which
                         // callers that print the error would drop.
                         let message = format!("API error: {}", failure.message);
-                        return Err(anyhow::Error::new(ApiFailure::new(failure.kind, message)));
+                        let mut terminal = ApiFailure::new(failure.kind, message);
+                        terminal.http_status = failure.http_status;
+                        terminal.retry_after = failure.retry_after;
+                        return Err(anyhow::Error::new(terminal));
                     }
                 }
             }
@@ -1429,21 +1605,33 @@ impl Engine {
                 } else {
                     model_status.to_string()
                 },
+                failure: if empty_completion {
+                    Some(ApiFailureKind::ProtocolError)
+                } else {
+                    model_failure
+                },
                 usage: model_usage,
             });
 
             if had_error {
                 self.checkpoint_transcript();
+                if let Some(delay) = pending_retry_delay.take() {
+                    if !Self::wait_before_retry(delay, &cancel).await {
+                        let _ = tx.send(StreamEvent::Interrupted).await;
+                        return Ok(());
+                    }
+                }
                 continue;
             }
 
             if empty_completion {
-                let message =
-                    "provider protocol error: response completed without assistant text or tool calls"
-                        .to_string();
-                let _ = tx.send(StreamEvent::Error(message.clone())).await;
+                let failure = ApiFailure::protocol_error(
+                    "provider protocol error: response completed without assistant text or tool calls",
+                );
+                let _ = tx.send(StreamEvent::Error(failure.message.clone())).await;
                 self.checkpoint_transcript();
-                return Err(anyhow::Error::new(ApiFailure::other(message)));
+                self.record_failure(&failure, transient_attempts + 1);
+                return Err(anyhow::Error::new(failure));
             }
 
             turn_had_meaningful_response = true;
@@ -2564,6 +2752,178 @@ mod tests {
         assert_eq!(result, "recovered response");
     }
 
+    struct TransientProvider {
+        failure: ApiFailure,
+        failures_before_success: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for TransientProvider {
+        fn name(&self) -> &str {
+            "transient"
+        }
+
+        fn set_model(&mut self, _model: &str) {}
+
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<ProviderStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures_before_success {
+                // Alternate pre-stream and mid-stream failures so both
+                // recovery paths are exercised.
+                if call % 2 == 0 {
+                    return Err(anyhow::Error::new(self.failure.clone()));
+                }
+                let (tx, rx) = mpsc::channel(4);
+                tx.send(ApiEvent::Text("partial".to_string()))
+                    .await
+                    .unwrap();
+                tx.send(ApiEvent::Error(self.failure.clone()))
+                    .await
+                    .unwrap();
+                drop(tx);
+                return Ok(ProviderStream::new(rx, cancel.child_token()));
+            }
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(ApiEvent::Text("recovered".to_string()))
+                .await
+                .unwrap();
+            tx.send(ApiEvent::Done).await.unwrap();
+            drop(tx);
+            Ok(ProviderStream::new(rx, cancel.child_token()))
+        }
+    }
+
+    fn transient_engine(
+        failure: ApiFailure,
+        failures_before_success: usize,
+    ) -> (Engine, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(TransientProvider {
+            failure,
+            failures_before_success,
+            calls: calls.clone(),
+        });
+        let mut engine =
+            Engine::for_tests(provider, SteeringQueue::default(), PermissionMode::Bypass);
+        engine.set_retry_backoff_base(std::time::Duration::from_millis(5));
+        (engine, calls)
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried_then_succeed() {
+        let (mut engine, calls) = transient_engine(
+            ApiFailure::new(ApiFailureKind::RateLimited, "429")
+                .with_status(Some(reqwest::StatusCode::TOO_MANY_REQUESTS)),
+            2,
+        );
+        let result = engine
+            .submit("go", tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, "recovered",
+            "rejected partial text must be discarded"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let timing = engine.execution_timing();
+        let statuses: Vec<&str> = timing
+            .model_rounds
+            .iter()
+            .map(|round| round.status.as_str())
+            .collect();
+        assert_eq!(statuses, vec!["retry", "retry", "completed"]);
+        assert_eq!(
+            timing.model_rounds[0].failure,
+            Some(ApiFailureKind::RateLimited)
+        );
+        assert!(engine.last_failure().is_none());
+    }
+
+    #[tokio::test]
+    async fn transient_failures_stop_after_the_retry_budget() {
+        let (mut engine, calls) = transient_engine(
+            ApiFailure::new(ApiFailureKind::Unavailable, "503")
+                .with_status(Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)),
+            usize::MAX,
+        );
+        let error = engine
+            .submit("go", tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + MAX_TRANSIENT_RETRIES as usize
+        );
+        assert_eq!(
+            error.downcast_ref::<ApiFailure>().map(|f| f.kind),
+            Some(ApiFailureKind::Unavailable)
+        );
+        let failure = engine.last_failure().expect("failure recorded");
+        assert_eq!(failure.kind, ApiFailureKind::Unavailable);
+        assert!(failure.retryable);
+        assert_eq!(failure.http_status, Some(503));
+        assert_eq!(failure.attempts, 1 + MAX_TRANSIENT_RETRIES);
+    }
+
+    #[tokio::test]
+    async fn a_committed_attempt_is_not_retried_for_a_transient_failure() {
+        let attempts =
+            committed_attempts_for(ApiFailure::new(ApiFailureKind::RateLimited, "429")).await;
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_observes_cancellation() {
+        let (mut engine, calls) = transient_engine(
+            ApiFailure::new(ApiFailureKind::RateLimited, "429")
+                .with_retry_after(Some(std::time::Duration::from_secs(30))),
+            usize::MAX,
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        let result = engine.submit("go", cancel).await;
+
+        assert!(result.is_ok(), "cancellation ends the turn cleanly");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the 30s Retry-After must not be awaited past cancellation"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_failures_are_recorded_without_retry() {
+        let (mut engine, calls) = transient_engine(
+            ApiFailure::new(ApiFailureKind::Authentication, "401")
+                .with_status(Some(reqwest::StatusCode::UNAUTHORIZED)),
+            usize::MAX,
+        );
+        let _ = engine
+            .submit("go", tokio_util::sync::CancellationToken::new())
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let failure = engine.last_failure().expect("failure recorded");
+        assert_eq!(failure.kind, ApiFailureKind::Authentication);
+        assert!(!failure.retryable);
+        assert_eq!(failure.attempts, 1);
+    }
+
     #[tokio::test]
     async fn an_unclassified_failure_triggers_no_recovery() {
         // The case the substring predicates got wrong: an error whose text
@@ -2991,6 +3351,7 @@ mod tests {
             index: 1,
             started_after_ms: 0,
             duration_ms: 10,
+            failure: None,
             status: "completed".to_string(),
             usage: None,
         });
@@ -3036,6 +3397,8 @@ mod tests {
             cost: CostTracker::new("test"),
             last_request_usage: None,
             last_compaction_notice: None,
+            last_failure: None,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         };
 
         // Create multiple read-only tool uses (Read and Glob)
@@ -3121,6 +3484,8 @@ mod tests {
             cost: CostTracker::new("test"),
             last_request_usage: None,
             last_compaction_notice: None,
+            last_failure: None,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         };
 
         // Mix read-only and write tools
@@ -4209,6 +4574,8 @@ mod tests {
             cost: CostTracker::new("test"),
             last_request_usage: None,
             last_compaction_notice: None,
+            last_failure: None,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         };
 
         let tool_uses = vec![(
@@ -4286,6 +4653,8 @@ mod tests {
             cost: CostTracker::new("test"),
             last_request_usage: None,
             last_compaction_notice: None,
+            last_failure: None,
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
         };
 
         // Under PermissionMode::Default, network reads ask for confirmation.

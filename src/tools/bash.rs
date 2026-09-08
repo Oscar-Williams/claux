@@ -16,6 +16,9 @@ use super::{Tool, ToolOutput};
 use crate::command_sandbox::CommandSandbox;
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Bytes of each stream retained in memory. Anything past this is drained
+/// and counted, never stored, so a runaway command cannot exhaust memory
+/// before the tool result is truncated for the model.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPTURE_LIMIT: usize = 50_000;
@@ -453,6 +456,34 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.trim().contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn bash_output_beyond_the_capture_limit_is_drained_not_stored() {
+        let tool = tool();
+        // 8 MiB of output: far beyond the per-stream capture limit. The
+        // command must finish (the pipe is drained), the result must stay
+        // bounded, and the omitted bytes must be reported.
+        let result = tool
+            .execute(
+                json!({"command": "head -c 8388608 /dev/zero | tr '\\0' 'x'"}),
+                token(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.content.len() <= CAPTURE_LIMIT + 160,
+            "{}",
+            result.content.len()
+        );
+        assert!(
+            result
+                .content
+                .contains("stdout truncated; 8338608 bytes omitted"),
+            "{}",
+            &result.content[result.content.len().saturating_sub(200)..]
+        );
+        assert!(!result.content.contains("timed out"));
     }
 
     #[tokio::test]

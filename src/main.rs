@@ -39,14 +39,25 @@ use clap::Parser;
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+async fn run() -> Result<std::process::ExitCode> {
+    use std::process::ExitCode;
     let args = cli::Cli::parse();
 
     if let Some(cli::CliCommand::SandboxExec { workspace, command }) = &args.command {
-        return command_sandbox::run_helper(workspace, command);
+        return command_sandbox::run_helper(workspace, command).map(|()| ExitCode::SUCCESS);
     }
     if matches!(args.command, Some(cli::CliCommand::SandboxProbe)) {
-        return command_sandbox::run_probe();
+        return command_sandbox::run_probe().map(|()| ExitCode::SUCCESS);
     }
 
     // Init logging
@@ -107,7 +118,7 @@ async fn main() -> Result<()> {
                         provider: cli::AuthProvider::Vercel,
                     } => auth::print_provider_token("vercel", "Vercel AI Gateway")?,
                 }
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             cli::CliCommand::Config {
                 command:
@@ -120,7 +131,7 @@ async fn main() -> Result<()> {
                 let path = onboarding::init_config(*provider, model.as_deref(), *force)?;
                 println!("Created {}", path.display());
                 println!("Run `claux doctor` to verify the setup.");
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             cli::CliCommand::Doctor { offline } => {
                 let config = config::Config::load(args.trust_project)?;
@@ -129,7 +140,7 @@ async fn main() -> Result<()> {
                 if !report.healthy {
                     anyhow::bail!("doctor found configuration errors");
                 }
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             cli::CliCommand::Usage { command } => {
                 match command {
@@ -137,7 +148,7 @@ async fn main() -> Result<()> {
                         usage::status(provider.as_deref(), *json).await?
                     }
                 }
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             cli::CliCommand::TokenizerFingerprint {
                 models,
@@ -158,7 +169,7 @@ async fn main() -> Result<()> {
                     *resume_fingerprint,
                 )
                 .await?;
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             cli::CliCommand::SandboxExec { .. } | cli::CliCommand::SandboxProbe => {
                 unreachable!("handled before logging")
@@ -248,30 +259,78 @@ async fn main() -> Result<()> {
                 .await
         };
         let response = shutdown::classify_one_shot_response(response, cancel.is_cancelled());
+        // Classify the failure for the transcript, the JSON output, and the
+        // exit code. Cancellation wins because the engine reports a clean
+        // interrupt rather than an error.
+        let failure: Option<query::FailureRecord> = if response.is_ok() {
+            None
+        } else if cancel.is_cancelled() {
+            Some(query::FailureRecord::cancelled(
+                engine.last_failure().map(|f| f.attempts).unwrap_or(1),
+            ))
+        } else {
+            Some(
+                engine
+                    .last_failure()
+                    .cloned()
+                    .unwrap_or_else(query::FailureRecord::unclassified),
+            )
+        };
         if let Some(path) = args.transcript.as_deref() {
             let error = response.as_ref().err().map(ToString::to_string);
-            let result = response.as_ref().ok().map(String::as_str);
+            let outcome = match (&response, &error) {
+                (Ok(result), _) => output::TranscriptOutcome::Completed { result },
+                (Err(_), Some(message)) => output::TranscriptOutcome::Error {
+                    message,
+                    failure: failure.as_ref(),
+                },
+                (Err(_), None) => unreachable!("errors always render a message"),
+            };
             let transcript = output::OneShotTranscript::new(
                 engine.model(),
                 &engine.cost,
                 engine.messages(),
                 engine.tool_trace(),
                 engine.execution_timing(),
-                result,
-                error.as_deref(),
+                outcome,
             );
             output::write_transcript(path, &transcript)?;
         }
-        let response = response?;
-        match args.output_format.unwrap_or_default() {
-            cli::OutputFormat::Text => print!("{response}"),
-            cli::OutputFormat::Json => {
-                let output = output::OneShotOutput::new(&response, engine.model(), &engine.cost);
-                serde_json::to_writer(std::io::stdout().lock(), &output)?;
-                println!();
+        let json = matches!(
+            args.output_format.unwrap_or_default(),
+            cli::OutputFormat::Json
+        );
+        match response {
+            Ok(response) => {
+                if json {
+                    let output =
+                        output::OneShotOutput::new(&response, engine.model(), &engine.cost);
+                    serde_json::to_writer(std::io::stdout().lock(), &output)?;
+                    println!();
+                } else {
+                    print!("{response}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let failure = failure.expect("failed responses are classified");
+                if json {
+                    // Always give supervisors a machine-readable outcome, not
+                    // just a stderr string and exit status.
+                    let output = output::OneShotOutput::failed(
+                        engine.model(),
+                        &engine.cost,
+                        &message,
+                        Some(&failure),
+                    );
+                    serde_json::to_writer(std::io::stdout().lock(), &output)?;
+                    println!();
+                }
+                eprintln!("Error: {error:?}");
+                return Ok(ExitCode::from(failure.kind.exit_code()));
             }
         }
-        return Ok(());
     }
 
     // Run session-start hooks
@@ -290,7 +349,9 @@ async fn main() -> Result<()> {
             });
             models.insert(0, requested_model.clone());
         }
-        return tui::run(&config, plugin_registry, models).await;
+        return tui::run(&config, plugin_registry, models)
+            .await
+            .map(|()| ExitCode::SUCCESS);
     }
 
     // Resume a previous session if requested. The matched id is handed to
@@ -332,7 +393,9 @@ async fn main() -> Result<()> {
     if let Some(messages) = resumed_messages {
         engine.set_messages(messages);
     }
-    repl::run(engine, &config, plugin_registry, resumed_id, resolved_model).await
+    repl::run(engine, &config, plugin_registry, resumed_id, resolved_model)
+        .await
+        .map(|()| ExitCode::SUCCESS)
 }
 
 async fn build_engine(
