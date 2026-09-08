@@ -311,7 +311,7 @@ impl PermissionChecker {
             "Bash" => {
                 let cmd = input["command"].as_str().unwrap_or("");
                 PermissionResult::Ask {
-                    message: format!("bash: {}", truncate(cmd, 80)),
+                    message: format!("bash{}: {}", background_hint(input), truncate(cmd, 80)),
                     diff: None,
                 }
             }
@@ -425,7 +425,11 @@ impl PermissionChecker {
                 } else if tool_name == "Bash" {
                     let cmd = input["command"].as_str().unwrap_or("");
                     PermissionResult::Ask {
-                        message: format!("Allow bash: {}?", truncate(cmd, 80)),
+                        message: format!(
+                            "Allow bash{}: {}?",
+                            background_hint(input),
+                            truncate(cmd, 80)
+                        ),
                         diff: None,
                     }
                 } else {
@@ -458,7 +462,11 @@ impl PermissionChecker {
                         "Bash" => {
                             let cmd = input["command"].as_str().unwrap_or("");
                             PermissionResult::Ask {
-                                message: format!("bash: {}", truncate(cmd, 80)),
+                                message: format!(
+                                    "bash{}: {}",
+                                    background_hint(input),
+                                    truncate(cmd, 80)
+                                ),
                                 diff: None,
                             }
                         }
@@ -493,6 +501,14 @@ impl PermissionChecker {
                 }
             }
         }
+    }
+}
+
+fn background_hint(input: &serde_json::Value) -> &'static str {
+    if input["background"].as_bool() == Some(true) {
+        " (background; stops on session close)"
+    } else {
+        ""
     }
 }
 

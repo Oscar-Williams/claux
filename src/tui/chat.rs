@@ -58,6 +58,10 @@ pub struct Activity {
 
 /// Chat screen state.
 pub struct ChatApp {
+    pub jobs: Vec<crate::tools::jobs::JobSnapshot>,
+    pub show_jobs: bool,
+    pub selected_job: usize,
+    pub job_scroll: u16,
     pub save_error: Option<String>,
     pub expand_tool_output: bool,
     pub activity: Option<Activity>,
@@ -101,6 +105,10 @@ pub struct ChatApp {
 impl ChatApp {
     pub fn new(model: &str, theme: Theme) -> Self {
         Self {
+            jobs: Vec::new(),
+            show_jobs: false,
+            selected_job: 0,
+            job_scroll: 0,
             save_error: None,
             expand_tool_output: false,
             activity: None,
@@ -136,6 +144,61 @@ impl ChatApp {
             role: crate::utils::sanitize_terminal_text(role),
             content: crate::utils::sanitize_terminal_text(content),
         });
+    }
+
+    fn refresh_jobs(&mut self, manager: &crate::tools::jobs::JobManager) {
+        self.jobs = manager.snapshots();
+        self.selected_job = self.selected_job.min(self.jobs.len().saturating_sub(1));
+        for job in manager.completions() {
+            self.add_message(
+                "system",
+                &format!(
+                    "Background {} {} after {}s: {}\n{}\n/jobs {} to inspect",
+                    job.id,
+                    job.status.label(),
+                    job.elapsed.as_secs(),
+                    crate::utils::truncate_str(&job.command, 120),
+                    crate::utils::tail_str(&job.output, 600),
+                    job.id
+                ),
+            );
+        }
+    }
+
+    fn job_key(&mut self, key: KeyEvent, manager: &crate::tools::jobs::JobManager) -> bool {
+        if key.kind == event::KeyEventKind::Release {
+            return false;
+        }
+        if key.code == KeyCode::F(6) {
+            self.show_jobs = !self.show_jobs;
+            return true;
+        }
+        if !self.show_jobs {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => self.show_jobs = false,
+            KeyCode::Up => {
+                self.selected_job = self.selected_job.saturating_sub(1);
+                self.job_scroll = 0;
+            }
+            KeyCode::Down => {
+                self.selected_job = (self.selected_job + 1).min(self.jobs.len().saturating_sub(1));
+                self.job_scroll = 0;
+            }
+            KeyCode::PageUp => self.job_scroll = self.job_scroll.saturating_add(10),
+            KeyCode::PageDown => self.job_scroll = self.job_scroll.saturating_sub(10),
+            KeyCode::Char('x') if key.modifiers.is_empty() => {
+                if let Some(job) = self.jobs.get(self.selected_job) {
+                    let _ = manager.cancel(&job.id);
+                }
+            }
+            _ if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') => {
+                return false
+            }
+            _ => {}
+        }
+        true
     }
 
     fn save_session(&mut self, db: &Db, session_id: &str, engine: &Engine) -> bool {
@@ -420,6 +483,22 @@ pub async fn run(
     models: &[ResolvedModel],
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Action> {
+    let jobs = engine.jobs();
+    jobs.enable();
+    let result = run_session(engine, session_id, db, terminal, theme, models, shutdown).await;
+    jobs.shutdown().await;
+    result
+}
+
+async fn run_session(
+    engine: &mut Engine,
+    session_id: &str,
+    db: &Db,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    theme: Theme,
+    models: &[ResolvedModel],
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<Action> {
     // Clear engine state and load this session's messages. repair_history
     // makes old or crash-interrupted saves API-valid (tool_use/tool_result
     // pairing) before the engine sends them anywhere.
@@ -457,6 +536,9 @@ pub async fn run(
     let mut pending_submit: Option<String> = None;
 
     loop {
+        let jobs = engine.jobs();
+        app.refresh_jobs(&jobs);
+        needs_redraw |= !app.jobs.is_empty();
         if shutdown.is_cancelled() {
             if !app.save_session(db, session_id, engine) {
                 anyhow::bail!(
@@ -474,6 +556,11 @@ pub async fn run(
         // Process pending submit
         if let Some(input) = pending_submit.take() {
             let trimmed = input.trim().to_string();
+            if trimmed == "/jobs" {
+                app.show_jobs = true;
+                needs_redraw = true;
+                continue;
+            }
 
             // Commands may clear history or switch sessions. Do not let an
             // outstanding save failure silently discard the only good copy.
@@ -641,6 +728,10 @@ pub async fn run(
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
+                    if app.job_key(key, &jobs) {
+                        needs_redraw = true;
+                        continue;
+                    }
                     if key.kind == event::KeyEventKind::Release {
                         continue;
                     }
@@ -666,7 +757,7 @@ pub async fn run(
                     }
                     needs_redraw = true;
                 }
-                Event::Paste(text) if app.mode == Mode::Input => {
+                Event::Paste(text) if app.mode == Mode::Input && !app.show_jobs => {
                     app.handle_paste(&text);
                     needs_redraw = true;
                 }
@@ -711,6 +802,7 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
     app.set_activity("Waiting for model response");
     let steering = engine.steering_queue();
     let steer_buf = app.steer_buf.clone();
+    let jobs = engine.jobs();
     let cancel = shutdown.child_token();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
 
@@ -880,7 +972,10 @@ async fn drive_streaming<B: ratatui::backend::Backend>(
                     }
                 }
                 _ = tick.tick() => {
-                    if poll_stream_key(keys, &steer_buf, &steering)? {
+                    app.refresh_jobs(&jobs);
+                    let event = keys.poll_event()?;
+                    let handled = match &event { Some(Event::Key(key)) => app.job_key(*key, &jobs), _ => app.show_jobs };
+                    if !handled && poll_stream_key(&mut SingleEvent(event), &steer_buf, &steering)? {
                         cancel.cancel();
                         app.set_activity("Interrupting");
                     }
@@ -920,6 +1015,7 @@ async fn prompt_permission_tui<B: ratatui::backend::Backend>(
     steering: &SteeringQueue,
 ) -> Result<PermissionResponse> {
     app.permission_prompt = Some(crate::utils::sanitize_terminal_text(summary));
+    app.show_jobs = false;
     app.permission_details = Some(
         format_permission_details(tool_name, input)
             .into_iter()
@@ -999,6 +1095,13 @@ pub trait KeySource {
     fn poll_event(&mut self) -> Result<Option<Event>>;
 }
 
+struct SingleEvent(Option<Event>);
+impl KeySource for SingleEvent {
+    fn poll_event(&mut self) -> Result<Option<Event>> {
+        Ok(self.0.take())
+    }
+}
+
 /// Reads keys from the real terminal without blocking.
 pub struct CrosstermKeys;
 
@@ -1069,6 +1172,12 @@ fn format_permission_details(tool_name: &str, input: &serde_json::Value) -> Vec<
 
     match tool_name {
         "Bash" => {
+            if input["background"].as_bool() == Some(true) {
+                lines.push(
+                    "Background job: continues across turns; stops when this session closes."
+                        .into(),
+                );
+            }
             if let Some(cmd) = input["command"].as_str() {
                 lines.push("Command:".to_string());
                 for line in cmd.lines() {
@@ -1843,6 +1952,83 @@ mod turn_tests {
     }
 
     #[tokio::test]
+    async fn background_bash_keeps_permissions_and_pairs_the_launch_result() {
+        for allow in [false, true] {
+            let mut engine = scripted_engine(
+                vec![tool_use(
+                    "bg",
+                    "Bash",
+                    serde_json::json!({
+                        "command": "printf ready; sleep 30", "background": true
+                    }),
+                )],
+                None,
+                PermissionMode::Default,
+            );
+            engine.jobs().enable();
+            let (mut app, mut terminal) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_turn(&mut engine, vec![ch(if allow { 'y' } else { 'n' })]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(engine.jobs().snapshots().len(), usize::from(allow));
+            let repaired = crate::session::repair_history(engine.messages().to_vec());
+            assert_eq!(
+                serde_json::to_value(&repaired).unwrap(),
+                serde_json::to_value(engine.messages()).unwrap()
+            );
+            if allow {
+                assert!(engine
+                    .undo_last_turn()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("background jobs"));
+                app.refresh_jobs(&engine.jobs());
+                app.show_jobs = true;
+                terminal.draw(|f| ui::draw_chat(f, &mut app)).unwrap();
+                assert!(buffer_text(&terminal).contains("running"));
+                assert!(app.job_key(ch('x'), &engine.jobs()));
+                engine.jobs().shutdown().await;
+                app.refresh_jobs(&engine.jobs());
+                assert!(matches!(
+                    app.jobs[0].status,
+                    crate::tools::jobs::JobStatus::Cancelled
+                ));
+                let count = app.messages.len();
+                app.refresh_jobs(&engine.jobs());
+                assert_eq!(count, app.messages.len(), "completion is displayed once");
+                assert!(app.job_key(
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    &engine.jobs()
+                ));
+                assert!(!app.show_jobs);
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_is_safe_when_empty_tiny_or_scrolled() {
+        let mut app = ChatApp::new("test", Theme::dark());
+        app.show_jobs = true;
+        let jobs = crate::tools::jobs::JobManager::default();
+        for key in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Char('x'),
+        ] {
+            assert!(app.job_key(KeyEvent::new(key, KeyModifiers::NONE), &jobs));
+        }
+        for (width, height) in [(1, 1), (20, 6), (100, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| ui::draw_chat(f, &mut app)).unwrap();
+        }
+        assert_eq!(app.selected_job, 0);
+    }
+
+    #[tokio::test]
     async fn permission_always_is_command_specific_for_bash() {
         let mut app = ChatApp::new("test-model", Theme::dark());
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -2105,6 +2291,12 @@ mod tuishot_shots {
         Unsaved,
 
         #[tuishot(
+            name = "chat-background-jobs",
+            description = "Session job dashboard with live output and cancellation"
+        )]
+        Jobs,
+
+        #[tuishot(
             name = "chat-permission",
             description = "Prompting for Bash permission"
         )]
@@ -2185,6 +2377,16 @@ mod tuishot_shots {
                 ChatShot::Unsaved => {
                     let mut app = sample_conversation();
                     app.record_save(Err(anyhow::anyhow!("database is read-only")));
+                    app
+                }
+                ChatShot::Jobs => {
+                    use crate::tools::jobs::{JobSnapshot, JobStatus};
+                    let mut app = sample_conversation();
+                    app.show_jobs = true;
+                    app.jobs = vec![JobSnapshot { id: "job-a12b".into(), command: "cargo test".into(), status: JobStatus::Running,
+                        elapsed: std::time::Duration::from_secs(42), output: "[stdout]\nrunning 548 tests\ntest jobs::launch_returns_early ... ok\ntest jobs::cancellation ... ok\nStill running...".into() },
+                        JobSnapshot { id: "job-c34d".into(), command: "docker compose build".into(), status: JobStatus::Succeeded,
+                        elapsed: std::time::Duration::from_secs(18), output: "Build complete".into() }];
                     app
                 }
             };

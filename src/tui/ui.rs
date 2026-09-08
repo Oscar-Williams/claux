@@ -591,6 +591,12 @@ fn draw_input_and_status(
         Span::styled(
             if app.save_error.is_some() {
                 " UNSAVED · Ctrl+S retry · keep this chat open ".to_string()
+            } else if !app.jobs.is_empty() {
+                format!(
+                    " {} background job(s) running · F6 tasks · {} ",
+                    app.jobs.iter().filter(|j| j.status.active()).count(),
+                    app.status
+                )
             } else {
                 format!(" {} ", app.status)
             },
@@ -602,6 +608,80 @@ fn draw_input_and_status(
         ),
     ]));
     f.render_widget(status, chunks[3]);
+    if app.show_jobs && app.mode != Mode::Permission {
+        draw_jobs(f, app);
+    }
+}
+
+fn draw_jobs(f: &mut Frame, app: &ChatApp) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length((app.jobs.len().min(8) as u16).max(1)),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    f.render_widget(Paragraph::new(" Background jobs (session-owned; stop on close)\n ↑/↓ select · PgUp/PgDn output · x cancel · Esc/F6 close"), rows[0]);
+    let start = app.selected_job.saturating_sub(7);
+    let list: Vec<Line> = app
+        .jobs
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(8)
+        .map(|(i, job)| {
+            Line::from(Span::styled(
+                format!(
+                    "{} {} | {} | {}s | {}",
+                    if i == app.selected_job { ">" } else { " " },
+                    job.id,
+                    job.status.label(),
+                    job.elapsed.as_secs(),
+                    job.command.replace('\n', " ")
+                ),
+                Style::default().fg(if i == app.selected_job {
+                    app.theme.warning
+                } else {
+                    app.theme.fg
+                }),
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(if list.is_empty() {
+            vec![Line::from(
+                " No jobs yet. Ask Claux to run a command in the background.",
+            )]
+        } else {
+            list
+        }),
+        rows[1],
+    );
+    if let Some(job) = app.jobs.get(app.selected_job) {
+        let text = if job.output.is_empty() {
+            "No output yet."
+        } else {
+            &job.output
+        };
+        let output = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} output (bounded) ", job.id)),
+        );
+        let total = output.line_count(rows[2].width.saturating_sub(2).max(1)) as u16;
+        let scroll = total
+            .saturating_sub(rows[2].height.saturating_sub(2))
+            .saturating_sub(app.job_scroll);
+        f.render_widget(output.scroll((scroll, 0)), rows[2]);
+    }
+    f.render_widget(
+        Paragraph::new(" Closing this panel keeps jobs running. Closing the session cancels them."),
+        rows[3],
+    );
 }
 
 fn activity_title(app: &ChatApp, now: std::time::Instant) -> String {

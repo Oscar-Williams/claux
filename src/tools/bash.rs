@@ -87,17 +87,30 @@ fn capture_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 
 pub struct BashTool {
     sandbox: Arc<CommandSandbox>,
+    jobs: Option<Arc<super::jobs::JobManager>>,
 }
 
 impl BashTool {
     pub fn new(sandbox: Arc<CommandSandbox>) -> Self {
-        Self { sandbox }
+        Self {
+            sandbox,
+            jobs: None,
+        }
+    }
+
+    pub fn with_jobs(sandbox: Arc<CommandSandbox>, jobs: Arc<super::jobs::JobManager>) -> Self {
+        Self {
+            sandbox,
+            jobs: Some(jobs),
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct Params {
     command: String,
+    #[serde(default)]
+    background: bool,
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
@@ -112,13 +125,14 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command. Use for git, build tools, or other CLI operations."
+        "Execute a bash command. Set background=true only when the user requests background work, allowing conversation to continue while it runs. Interactive sessions only. Use Jobs to inspect completion or cancel; starting a job does not mean its command succeeded."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "background": {"type": "boolean", "description": "Run as a session-owned background job (default false). Same permissions, sandbox and timeout as foreground Bash; cancelled when the session closes."},
                 "command": {
                     "type": "string",
                     "description": "The bash command to execute"
@@ -160,7 +174,16 @@ impl Tool for BashTool {
         cancel: CancellationToken,
         progress: Option<tokio::sync::watch::Sender<String>>,
     ) -> Result<ToolOutput> {
-        let params: Params = serde_json::from_value(input)?;
+        let params: Params = serde_json::from_value(input.clone())?;
+        if cancel.is_cancelled() {
+            return Ok(super::interrupted_output());
+        }
+        if params.background {
+            let jobs = self.jobs.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Background jobs are unavailable here; use foreground Bash.")
+            })?;
+            return jobs.start(self.sandbox.clone(), input, &cancel);
+        }
 
         let timeout_ms = params.timeout.unwrap_or(120_000).min(600_000);
         let timeout = Duration::from_millis(timeout_ms);

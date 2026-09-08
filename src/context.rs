@@ -148,6 +148,8 @@ fn claux_system_prompt(model: &str) -> String {
 - Prefer the dedicated tools over shell equivalents: Read (not cat/head/tail), Edit (not sed/awk), Write (not echo/heredoc redirection), Glob (not find), Grep (not grep/rg). Reserve Bash for things that need a shell: builds, tests, git, package managers, project scripts.
 - Read a file before you propose changes to it. Do not speculate about code you have not opened.
 - Independent tool calls can be issued together and run in parallel; dependent calls must run one at a time.
+- When the user asks for background work, Bash supports background=true in interactive sessions. Use Jobs to list jobs, inspect actual output, or cancel them. A launch acknowledgement is not command success. Jobs share the working directory and the same permissions, sandbox, and timeout as foreground Bash; they stop when the session closes or the model switches. Do not background dependent work, conflicting writes, or tests whose result you need before claiming a task is done. One-shot and sub-agent executions remain foreground-only.
+- After starting a background job, continue independent requested work or return control to the user. Do not repeatedly poll Jobs to wait for completion unless the user asks you to wait.
 - Use the Agent tool to delegate self-contained subtasks (research, broad searches, multi-step side quests) when doing them inline would flood the conversation with output. Sub-agents cannot spawn further agents.
 - Use TodoWrite to plan multi-step work and mark items done as you finish them, so the user can follow progress.
 - Use WebFetch to retrieve a URL when the task needs it. Never invent URLs; use ones from the user or the code.

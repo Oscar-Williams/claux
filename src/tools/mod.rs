@@ -3,6 +3,7 @@ mod bash;
 mod edit;
 mod glob;
 mod grep;
+pub(crate) mod jobs;
 pub(crate) mod mcp;
 pub(crate) mod read;
 mod search_filter;
@@ -76,6 +77,7 @@ pub trait Tool: Send + Sync {
 /// Registry holding all available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    pub jobs: Arc<jobs::JobManager>,
 }
 
 impl ToolRegistry {
@@ -93,6 +95,7 @@ impl ToolRegistry {
         command_sandbox: Arc<CommandSandbox>,
     ) -> Self {
         let todo_state = todo::new_todo_state();
+        let jobs = Arc::new(jobs::JobManager::default());
         Self {
             tools: vec![
                 Box::new(read::ReadTool::new(sandbox_policy.clone())),
@@ -100,7 +103,11 @@ impl ToolRegistry {
                 Box::new(edit::EditTool::new(sandbox_policy.clone())),
                 Box::new(glob::GlobTool::new(sandbox_policy.clone())),
                 Box::new(grep::GrepTool::new(sandbox_policy.clone())),
-                Box::new(bash::BashTool::new(command_sandbox.clone())),
+                Box::new(bash::BashTool::with_jobs(
+                    command_sandbox.clone(),
+                    jobs.clone(),
+                )),
+                Box::new(jobs::JobsTool(jobs.clone())),
                 Box::new(web_fetch::WebFetchTool::new()),
                 Box::new(agent::AgentTool::new(
                     factory,
@@ -113,6 +120,7 @@ impl ToolRegistry {
                 )),
                 Box::new(todo::TodoWriteTool::new(todo_state)),
             ],
+            jobs,
         }
     }
 
@@ -122,6 +130,7 @@ impl ToolRegistry {
         command_sandbox: Arc<CommandSandbox>,
     ) -> Self {
         let todo_state = todo::new_todo_state();
+        let jobs = Arc::new(jobs::JobManager::default());
         Self {
             tools: vec![
                 Box::new(read::ReadTool::new(sandbox_policy.clone())),
@@ -129,10 +138,12 @@ impl ToolRegistry {
                 Box::new(edit::EditTool::new(sandbox_policy.clone())),
                 Box::new(glob::GlobTool::new(sandbox_policy.clone())),
                 Box::new(grep::GrepTool::new(sandbox_policy)),
-                Box::new(bash::BashTool::new(command_sandbox)),
+                Box::new(bash::BashTool::with_jobs(command_sandbox, jobs.clone())),
+                Box::new(jobs::JobsTool(jobs.clone())),
                 Box::new(web_fetch::WebFetchTool::new()),
                 Box::new(todo::TodoWriteTool::new(todo_state)),
             ],
+            jobs,
         }
     }
 
@@ -157,6 +168,7 @@ impl ToolRegistry {
 
     /// Clear conversation-scoped state held by registered tools.
     pub fn reset_session(&self) {
+        self.jobs.reset();
         for tool in &self.tools {
             tool.reset_session();
         }

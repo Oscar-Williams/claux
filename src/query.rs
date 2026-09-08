@@ -395,6 +395,8 @@ impl Engine {
     }
 
     pub fn undo_last_turn(&mut self) -> Result<String> {
+        anyhow::ensure!(!self.jobs().snapshots().iter().any(|job| job.status.active()),
+            "Wait for or cancel background jobs before undoing a turn; they may still be changing files.");
         let checkpoint = self.last_checkpoint.as_ref().ok_or_else(|| {
             anyhow::anyhow!("No turn checkpoint is available (checkpoints require a Git worktree).")
         })?;
@@ -511,6 +513,10 @@ impl Engine {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn jobs(&self) -> std::sync::Arc<crate::tools::jobs::JobManager> {
+        self.tools.jobs.clone()
     }
 
     pub fn tool_trace(&self) -> &[ToolTraceEntry] {
@@ -1104,9 +1110,22 @@ impl Engine {
             }
 
             let tool_defs = self.tools.definitions();
-            let effective_system_prompt = retry_prompt
+            let mut effective_system_prompt = retry_prompt
                 .as_ref()
                 .map(|prompt| format!("{}\n\n{prompt}", self.system_prompt));
+            let jobs = self.jobs().snapshots();
+            if !jobs.is_empty() {
+                // Only trusted lifecycle metadata belongs in instructions.
+                // Commands and output remain tool data, retrieved with Jobs.
+                let states = jobs
+                    .iter()
+                    .map(|job| format!("{}: {}", job.id, job.status.label()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prompt =
+                    effective_system_prompt.get_or_insert_with(|| self.system_prompt.clone());
+                prompt.push_str(&format!("\n\nSession background jobs:\n{states}\nUse Jobs to inspect output before reporting results. Do not start another job merely to check on an existing job."));
+            }
             let model_started_after_ms = self.trace_offset_ms();
             let model_started = Instant::now();
             let _ = tx.send(StreamEvent::ModelRequest).await;
