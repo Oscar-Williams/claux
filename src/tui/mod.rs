@@ -201,6 +201,11 @@ pub async fn run(
     // Drop the guard before flushing diagnostics, including on restore errors.
     drop(terminal_guard);
     drop(tui_logs);
+    if forced_shutdown {
+        if let Some(engine) = &engine {
+            engine.jobs().shutdown().await;
+        }
+    }
 
     if forced_shutdown || app_result.is_err() {
         if let (Some(session_id), Some(engine)) = (&active_session, &engine) {

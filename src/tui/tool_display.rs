@@ -29,7 +29,7 @@ fn bash(fallback: &str, input: &Value) -> ToolPresentation {
     let command = string(input, "command").unwrap_or(fallback);
     let description = string(input, "description").filter(|value| !value.is_empty());
     let timeout = input.get("timeout").and_then(Value::as_u64);
-    let detail = match (description, timeout) {
+    let mut detail = match (description, timeout) {
         (Some(description), Some(timeout)) => Some(format!(
             "{} · {} timeout",
             clipped(description),
@@ -39,6 +39,12 @@ fn bash(fallback: &str, input: &Value) -> ToolPresentation {
         (None, Some(timeout)) => Some(format!("{} timeout", duration(timeout))),
         (None, None) => None,
     };
+    if input["background"].as_bool() == Some(true) {
+        detail = Some(format!(
+            "Background job · {}",
+            detail.as_deref().unwrap_or("stops when session closes")
+        ));
+    }
     ToolPresentation {
         summary: format!("$ {}", clipped(command)),
         detail,

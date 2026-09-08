@@ -83,11 +83,21 @@ pub async fn run(
 
     loop {
         // Read user input
+        let jobs = engine.jobs();
+        jobs.enable();
+        let mut job_tick = tokio::time::interval(std::time::Duration::from_millis(200));
         print!("\x1b[1;34m>\x1b[0m ");
         stdout().flush()?;
         let input = loop {
             tokio::select! {
                 line = stdin_rx.recv() => break line,
+                _ = job_tick.tick() => {
+                    for job in jobs.completions() {
+                        println!("\nBackground {} {} after {}s. /jobs {} to inspect.", job.id, job.status.label(), job.elapsed.as_secs(), job.id);
+                        print!("\x1b[1;34m>\x1b[0m ");
+                        stdout().flush()?;
+                    }
+                }
                 _ = tokio::signal::ctrl_c() => {
                     if ctrl_c.press() {
                         break None;
@@ -142,6 +152,7 @@ pub async fn run(
                             .await?;
                             resumed_engine.set_system_prompt(system_prompt);
                             resumed_engine.set_messages(messages);
+                            engine.jobs().shutdown().await;
                             engine = resumed_engine;
                             session_path = path;
                             println!(
@@ -190,6 +201,7 @@ pub async fn run(
                             .await;
                             match rebuilt {
                                 Ok(next_engine) => {
+                                    engine.jobs().shutdown().await;
                                     engine = next_engine;
                                     resolved_model = next_model;
                                     session::save_model_binding(
@@ -427,6 +439,7 @@ pub async fn run(
 
     println!("\n{}", engine.cost.format_summary());
     println!("Goodbye!");
+    engine.jobs().shutdown().await;
     Ok(())
 }
 

@@ -25,11 +25,14 @@ A terminal-based AI coding assistant written in Rust. Streams responses, execute
 - **Context assembly** — git status, CLAUDE.md, environment info in system prompt. Checked-in CLAUDE.md is loaded only for trusted projects (the user's `~/.claude/CLAUDE.md` always is), and each file is size-capped
 - **TUI mode** — full-screen ratatui interface with `--tui`
 - **Visible activity**: the input border shows whether the model is responding, tools are queued, or a tool is executing, with elapsed time and a notice after ten seconds without updates. Bash shows a live, bounded output tail. Completed tools retain an output preview, including failures; Ctrl+O while idle expands or collapses results (up to the last 20 KB per tool). Ctrl+C interrupts a silent turn.
+- **Background jobs**: ask Claux to run a Bash command in the background and keep chatting. F6 or `/jobs` opens the TUI dashboard with status, elapsed time, and bounded live output. Use arrows to select, PgUp/PgDn to scroll output, `x` to cancel, and Esc/F6 to return to chat. `/jobs <id>` and `/jobs cancel <id>` also work in the REPL. Completion notices do not start another model request automatically; the model can inspect results through the Jobs tool on your next turn.
 - **Save recovery**: a persistent `UNSAVED` footer warns if session storage fails. Ctrl+S retries; session-changing commands and normal exits are paused until saving succeeds. If shutdown cannot save, Claux attempts a private recovery JSON export in the temporary directory and prints its location. Copy that export somewhere permanent for manual recovery. Diagnostic logs are buffered (up to 64 KB) until the terminal is restored, so they cannot overwrite the active TUI.
 - **Terminal restoration**: the TUI restores keyboard modes, bracketed paste, colors, the main screen, and the cursor on exit, startup failure, or panic unwinding. On Unix, SIGTERM, SIGHUP, and external SIGINT request a graceful shutdown, including cancellation and session saving. If shutdown takes more than five seconds, Claux stops waiting, restores the terminal, and attempts to save repaired partial history. SIGKILL cannot be handled; use `reset` if a forced kill leaves your shell in raw mode.
 - **Multi-provider** — Anthropic, OpenAI, Ollama, or any OpenAI-compatible endpoint
 - **Native system prompt** — claux speaks as claux; the full prompt is readable in `src/context.rs`, and what you read is what the model gets
 - **Markdown rendering** — code blocks, bold, headers in the TUI
+
+Background jobs retain the same Bash permissions, sandbox, and timeout (two minutes by default, at most ten minutes). Up to four jobs run concurrently; the latest 32 results are retained in memory, with up to 50 KB captured per output stream. Jobs share your working directory, so avoid conflicting writes. They survive turn cancellation but stop on session close, model switch, or normal application exit. They are not persistent services and cannot be resumed after restart. One-shot runs and sub-agents remain foreground-only. `/undo-turn` waits until jobs have stopped.
 
 ## Screenshots
 
@@ -40,6 +43,8 @@ stale.
 ![Session browser with two projects](docs/screens/home-populated.svg)
 
 ![Creating a new session](docs/screens/home-new-session.svg)
+
+![Background job dashboard](docs/screens/chat-background-jobs.svg)
 
 ## Install
 

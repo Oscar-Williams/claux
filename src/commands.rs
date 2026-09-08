@@ -138,6 +138,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui_only: true,
     },
     CommandSpec {
+        name: "/jobs",
+        aliases: &[],
+        summary: "Background jobs: inspect output or cancel",
+        arg: Some("[job-id | cancel job-id]"),
+        tui_only: false,
+    },
+    CommandSpec {
         name: "/exit",
         aliases: &["/quit"],
         summary: "Exit claux",
@@ -183,6 +190,7 @@ pub enum CommandResult {
 }
 
 pub enum AsyncCommand {
+    Jobs(String),
     Compact,
     Diff,
     UndoTurn,
@@ -222,6 +230,7 @@ pub fn parse_command(input: &str, surface: Surface) -> Option<CommandResult> {
             "/home is only available in the full-screen TUI (claux --tui).".to_string(),
         )),
         "/help" => Some(CommandResult::Text(help_text(surface))),
+        "/jobs" => Some(CommandResult::Async(AsyncCommand::Jobs(args.to_string()))),
         "/exit" => Some(CommandResult::Exit),
         "/clear" => Some(CommandResult::Text("\x1b[2J\x1b[H".to_string())),
         "/compact" => Some(CommandResult::Async(AsyncCommand::Compact)),
@@ -272,6 +281,7 @@ pub fn parse_command(input: &str, surface: Surface) -> Option<CommandResult> {
 pub async fn execute_async(cmd: AsyncCommand, engine: &mut Engine) -> Result<String> {
     match cmd {
         AsyncCommand::Compact => engine.compact().await,
+        AsyncCommand::Jobs(args) => engine.jobs().command(&args),
         AsyncCommand::Diff => Ok(engine.last_turn_diff()),
         AsyncCommand::UndoTurn => engine.undo_last_turn(),
         AsyncCommand::Image(path) => {
@@ -550,6 +560,20 @@ mod tests {
             parse_command("/undo-turn", Surface::Tui),
             Some(CommandResult::Async(AsyncCommand::UndoTurn))
         ));
+    }
+
+    #[test]
+    fn jobs_command_parses_in_both_surfaces() {
+        for surface in [Surface::Tui, Surface::Repl] {
+            for args in ["", "job-123", "cancel job-123"] {
+                let Some(CommandResult::Async(AsyncCommand::Jobs(parsed))) =
+                    parse_command(&format!("/jobs {args}"), surface)
+                else {
+                    panic!("expected Jobs command");
+                };
+                assert_eq!(parsed, args);
+            }
+        }
     }
 
     #[test]
