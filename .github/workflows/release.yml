@@ -54,7 +54,44 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
 
+      - name: Write per-asset checksum
+        shell: bash
+        run: |
+          sha256sum ${{ matrix.asset_name }} | tee ${{ matrix.asset_name }}.sha256
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset_name }}
+          files: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+
+  checksums:
+    name: Publish SHA256SUMS
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download every release binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'claux-*' \
+            --dir assets
+          rm -f assets/*.sha256
+
+      # One file in sha256sum(1) format so consumers can run
+      # `sha256sum --check --ignore-missing SHA256SUMS` next to the asset
+      # they downloaded. The per-asset .sha256 files above are convenient
+      # for scripts that fetch a single binary.
+      - name: Write SHA256SUMS
+        run: |
+          (cd assets && sha256sum claux-*) | tee SHA256SUMS
+
+      - name: Publish SHA256SUMS
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS

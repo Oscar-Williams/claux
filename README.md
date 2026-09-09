@@ -58,6 +58,19 @@ cargo install --path .
 
 Requires Rust 1.88+. A `shell.nix` is included.
 
+Every release publishes a `SHA256SUMS` file and a `<asset>.sha256` next to
+each binary. Verify a download before running it:
+
+```bash
+tag=v20260908.0.0
+curl -fsSLO "https://github.com/ducks/claux/releases/download/$tag/claux-linux-x86_64"
+curl -fsSLO "https://github.com/ducks/claux/releases/download/$tag/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Harnesses that pin a release should pin the digest from that file as well,
+so a re-tagged or tampered asset fails closed.
+
 ## First run
 
 Create a starter configuration for Anthropic, OpenAI, OpenRouter, OpenCode Go,
