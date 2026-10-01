@@ -79,6 +79,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui_only: false,
     },
     CommandSpec {
+        name: "/auto",
+        aliases: &[],
+        summary: "Toggle auto permission mode for this session",
+        arg: None,
+        tui_only: false,
+    },
+    CommandSpec {
         name: "/diff",
         aliases: &[],
         summary: "Show the last turn's file changes",
@@ -192,6 +199,7 @@ pub enum CommandResult {
 pub enum AsyncCommand {
     Jobs(String),
     Compact,
+    Auto,
     Diff,
     UndoTurn,
     Image(PathBuf),
@@ -234,6 +242,7 @@ pub fn parse_command(input: &str, surface: Surface) -> Option<CommandResult> {
         "/exit" => Some(CommandResult::Exit),
         "/clear" => Some(CommandResult::Text("\x1b[2J\x1b[H".to_string())),
         "/compact" => Some(CommandResult::Async(AsyncCommand::Compact)),
+        "/auto" => Some(CommandResult::Async(AsyncCommand::Auto)),
         "/context" => Some(CommandResult::Text("__context__".to_string())),
         "/diff" => Some(CommandResult::Async(AsyncCommand::Diff)),
         "/undo-turn" => Some(CommandResult::Async(AsyncCommand::UndoTurn)),
@@ -281,6 +290,17 @@ pub fn parse_command(input: &str, surface: Surface) -> Option<CommandResult> {
 pub async fn execute_async(cmd: AsyncCommand, engine: &mut Engine) -> Result<String> {
     match cmd {
         AsyncCommand::Compact => engine.compact().await,
+        AsyncCommand::Auto => {
+            let (enabled, mode) = engine.toggle_auto_mode();
+            if enabled {
+                Ok("Auto mode enabled for this session.".to_string())
+            } else {
+                Ok(format!(
+                    "Auto mode disabled; restored {} mode.",
+                    mode.as_str()
+                ))
+            }
+        }
         AsyncCommand::Jobs(args) => engine.jobs().command(&args),
         AsyncCommand::Diff => Ok(engine.last_turn_diff()),
         AsyncCommand::UndoTurn => engine.undo_last_turn(),
@@ -547,6 +567,18 @@ mod tests {
         assert!(matches!(
             parse_command("/compact", Surface::Tui),
             Some(CommandResult::Async(AsyncCommand::Compact))
+        ));
+    }
+
+    #[test]
+    fn auto_returns_async_toggle() {
+        assert!(matches!(
+            parse_command("/auto", Surface::Tui),
+            Some(CommandResult::Async(AsyncCommand::Auto))
+        ));
+        assert!(matches!(
+            parse_command("/auto", Surface::Repl),
+            Some(CommandResult::Async(AsyncCommand::Auto))
         ));
     }
 

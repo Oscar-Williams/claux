@@ -635,6 +635,12 @@ impl Engine {
         self.tools.jobs.clone()
     }
 
+    /// Toggle session-local auto permissions and return the resulting mode.
+    pub fn toggle_auto_mode(&mut self) -> (bool, crate::permissions::PermissionMode) {
+        let enabled = self.permissions.toggle_auto();
+        (enabled, self.permissions.mode())
+    }
+
     pub fn tool_trace(&self) -> &[ToolTraceEntry] {
         &self.tool_trace
     }

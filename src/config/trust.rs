@@ -51,7 +51,8 @@ fn permission_rank(mode: PermissionMode) -> u8 {
         PermissionMode::Plan => 0,
         PermissionMode::Default => 1,
         PermissionMode::AcceptEdits => 2,
-        PermissionMode::Bypass => 3,
+        PermissionMode::Auto => 3,
+        PermissionMode::Bypass => 4,
     }
 }
 
@@ -84,7 +85,7 @@ mod tests {
     fn untrusted_project_cannot_loosen_permissions() {
         assert!(!permits_permission_override(
             PermissionMode::Default,
-            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
             false
         ));
         assert!(!permits_permission_override(
