@@ -45,6 +45,7 @@ unicode-width = "0.2"
 # File search
 walkdir = "2.5"
 glob = "0.3"
+shlex = "1.3"
 
 # Content search (ripgrep)
 grep-regex = "0.1"

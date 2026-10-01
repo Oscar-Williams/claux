@@ -163,6 +163,8 @@ pub enum PermissionResponse {
     AlwaysAllow,
     /// Always allow this specific command (for Bash tool only)
     AlwaysAllowCommand(String),
+    /// Always allow this conservative Bash command family for the session
+    AlwaysAllowCommandType(String),
     /// Deny and cancel remaining tools, with a message sent to the model
     DenyAndCancel,
 }
@@ -170,17 +172,208 @@ pub enum PermissionResponse {
 impl PermissionResponse {
     /// Build an "always allow" response with the narrowest useful scope.
     ///
-    /// Bash grants are tied to the exact raw command rather than the
+    /// Common development commands receive a conservative reusable family;
+    /// everything else is tied to the exact raw command rather than the
     /// human-readable (and potentially truncated) permission summary.
     pub fn always_allow_for(tool_name: &str, input: &serde_json::Value) -> Self {
         if tool_name == "Bash" {
             return input["command"]
                 .as_str()
-                .map(|command| Self::AlwaysAllowCommand(command.to_string()))
+                .map(|command| {
+                    bash_command_type(command)
+                        .map(|command_type| Self::AlwaysAllowCommandType(command_type.key))
+                        .unwrap_or_else(|| Self::AlwaysAllowCommand(command.to_string()))
+                })
                 .unwrap_or(Self::Allow);
         }
         Self::AlwaysAllow
     }
+
+    pub fn always_allow_label(tool_name: &str, input: &serde_json::Value) -> String {
+        if tool_name != "Bash" {
+            return "(a)lways allow this tool".to_string();
+        }
+        input["command"]
+            .as_str()
+            .and_then(bash_command_type)
+            .map(|command_type| format!("(a)lways allow {} commands", command_type.label))
+            .unwrap_or_else(|| "(a)lways allow this exact command".to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BashCommandType {
+    key: String,
+    label: String,
+}
+
+impl BashCommandType {
+    fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// Return a narrow reusable family for common development commands. Unknown,
+/// mutating, compound, redirected, or dynamically expanded commands retain
+/// exact-command approval.
+fn bash_command_type(command: &str) -> Option<BashCommandType> {
+    if command.contains(['\n', ';', '|', '&', '>', '<', '`'])
+        || command.contains("$(")
+        || command.contains("${")
+    {
+        return None;
+    }
+    command_type_from_words(&shlex::split(command)?)
+}
+
+fn command_type_from_words(words: &[String]) -> Option<BashCommandType> {
+    let executable = words.first()?;
+    if is_environment_assignment(executable) || executable.contains(['/', '\\']) {
+        return None;
+    }
+
+    match executable.as_str() {
+        "cargo" => typed_subcommand(
+            "cargo",
+            words,
+            &["bench", "build", "check", "clippy", "doc", "fmt", "test"],
+        ),
+        "go" => typed_subcommand("go", words, &["build", "test", "vet"]),
+        "git" => typed_subcommand("git", words, &["diff", "log", "show", "status"]),
+        "gh" => gh_command_type(words),
+        "npm" | "pnpm" | "yarn" | "bun" => package_script_type(executable, words),
+        "bundle" if words.get(1).map(String::as_str) == Some("exec") => {
+            test_runner_type(words.get(2..).unwrap_or_default(), Some("bundle exec"))
+        }
+        "make" => make_command_type(words),
+        "nix-shell" => nested_command_type("nix-shell", words, "--run"),
+        "nix" if words.get(1).map(String::as_str) == Some("develop") => {
+            nested_command_type("nix develop", words, "-c")
+        }
+        "pytest" | "rspec" | "rubocop" => Some(BashCommandType::new(executable, executable)),
+        "cargo-nextest" if words.get(1).map(String::as_str) == Some("run") => Some(
+            BashCommandType::new("cargo-nextest:run", "cargo nextest run"),
+        ),
+        "cat" | "df" | "du" | "file" | "grep" | "head" | "ls" | "pwd" | "rg" | "stat" | "tail"
+        | "type" | "wc" | "which" => Some(BashCommandType::new(executable, executable)),
+        _ => None,
+    }
+}
+
+fn typed_subcommand(
+    executable: &str,
+    words: &[String],
+    allowed: &[&str],
+) -> Option<BashCommandType> {
+    // Do not skip flags here: many command-level options consume the next word.
+    // Mistaking an option value for a subcommand would silently broaden a grant.
+    let subcommand = words.get(1)?;
+    allowed.contains(&subcommand.as_str()).then(|| {
+        BashCommandType::new(
+            format!("{executable}:{subcommand}"),
+            format!("{executable} {subcommand}"),
+        )
+    })
+}
+
+fn gh_command_type(words: &[String]) -> Option<BashCommandType> {
+    let group = words.get(1)?.as_str();
+    let action = words.get(2)?.as_str();
+    let allowed = match group {
+        "pr" => &["checks", "diff", "list", "status", "view"][..],
+        "issue" => &["list", "status", "view"][..],
+        "run" => &["list", "view", "watch"][..],
+        "repo" => &["list", "view"][..],
+        _ => return None,
+    };
+    allowed.contains(&action).then(|| {
+        BashCommandType::new(
+            format!("gh:{group}:{action}"),
+            format!("gh {group} {action}"),
+        )
+    })
+}
+
+fn package_script_type(executable: &str, words: &[String]) -> Option<BashCommandType> {
+    match words.get(1)?.as_str() {
+        "test" => Some(BashCommandType::new(
+            format!("{executable}:test"),
+            format!("{executable} test"),
+        )),
+        "run" => {
+            let script = words.get(2)?;
+            is_simple_name(script).then(|| {
+                BashCommandType::new(
+                    format!("{executable}:run:{script}"),
+                    format!("{executable} run {script}"),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+fn test_runner_type(words: &[String], prefix: Option<&str>) -> Option<BashCommandType> {
+    let runner = std::path::Path::new(words.first()?).file_name()?.to_str()?;
+    ["pytest", "rspec", "rubocop"].contains(&runner).then(|| {
+        let label = prefix
+            .map(|prefix| format!("{prefix} {runner}"))
+            .unwrap_or_else(|| runner.to_string());
+        BashCommandType::new(label.replace(' ', ":"), label)
+    })
+}
+
+fn make_command_type(words: &[String]) -> Option<BashCommandType> {
+    // Like command subcommands, targets after options are ambiguous because
+    // flags such as `-f` consume their following word.
+    let target = words.get(1)?;
+    if target.starts_with('-') || target.contains('=') {
+        return None;
+    }
+    [
+        "check", "ci", "fmt", "format", "lint", "spec", "test", "verify",
+    ]
+    .contains(&target.as_str())
+    .then(|| BashCommandType::new(format!("make:{target}"), format!("make {target}")))
+}
+
+fn nested_command_type(
+    wrapper: &str,
+    words: &[String],
+    command_flag: &str,
+) -> Option<BashCommandType> {
+    let command_index = words.iter().position(|word| word == command_flag)?;
+    let nested_words = if command_flag == "--run" {
+        shlex::split(words.get(command_index + 1)?)?
+    } else {
+        words.get(command_index + 1..)?.to_vec()
+    };
+    let nested = command_type_from_words(&nested_words)?;
+    let wrapper_context = words.get(..command_index)?.join("\u{1f}");
+    Some(BashCommandType::new(
+        format!("{wrapper}:{wrapper_context}:{}", nested.key),
+        format!("{} via {wrapper}", nested.label),
+    ))
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn is_simple_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 /// A decision returned by an `on_permission_check` hook.
@@ -284,6 +477,8 @@ pub struct PermissionChecker {
     session_allows: std::collections::HashSet<String>,
     /// Specific bash commands the user has "always allowed" this session
     bash_command_allows: std::collections::HashSet<String>,
+    /// Conservative Bash command families allowed for this session
+    bash_command_type_allows: std::collections::HashSet<String>,
 }
 
 impl PermissionChecker {
@@ -293,6 +488,7 @@ impl PermissionChecker {
             rules: PermissionRules::default(),
             session_allows: std::collections::HashSet::new(),
             bash_command_allows: std::collections::HashSet::new(),
+            bash_command_type_allows: std::collections::HashSet::new(),
         }
     }
 
@@ -360,10 +556,17 @@ impl PermissionChecker {
         self.bash_command_allows.insert(cmd.to_string());
     }
 
+    /// Record that the user allowed a conservative Bash command family.
+    pub fn always_allow_command_type(&mut self, command_type: &str) {
+        self.bash_command_type_allows
+            .insert(command_type.to_string());
+    }
+
     /// Clear permissions granted for the previous conversation.
     pub fn reset_session(&mut self) {
         self.session_allows.clear();
         self.bash_command_allows.clear();
+        self.bash_command_type_allows.clear();
     }
 
     /// Check whether a tool invocation should be allowed.
@@ -391,6 +594,11 @@ impl PermissionChecker {
         if tool_name == "Bash" {
             if let Some(cmd) = input["command"].as_str() {
                 if self.bash_command_allows.contains(cmd) {
+                    return PermissionResult::Allow;
+                }
+                if bash_command_type(cmd).is_some_and(|command_type| {
+                    self.bash_command_type_allows.contains(&command_type.key)
+                }) {
                     return PermissionResult::Allow;
                 }
             }
@@ -686,6 +894,110 @@ mod tests {
             checker.check("Bash", &bash_input, false),
             PermissionResult::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn always_allow_groups_known_development_command_types() {
+        assert_eq!(
+            PermissionResponse::always_allow_for("Bash", &json!({"command": "cargo test --lib"})),
+            PermissionResponse::AlwaysAllowCommandType("cargo:test".to_string())
+        );
+        assert_eq!(
+            PermissionResponse::always_allow_for(
+                "Bash",
+                &json!({"command": "bundle exec rspec spec/models/user_spec.rb"})
+            ),
+            PermissionResponse::AlwaysAllowCommandType("bundle:exec:rspec".to_string())
+        );
+        assert_eq!(
+            PermissionResponse::always_allow_for(
+                "Bash",
+                &json!({"command": "nix-shell shell.nix --run 'cargo test --lib'"})
+            ),
+            PermissionResponse::AlwaysAllowCommandType(
+                "nix-shell:nix-shell\u{1f}shell.nix:cargo:test".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn command_type_grant_allows_variants_but_not_sibling_types() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.always_allow_command_type("cargo:test");
+
+        assert!(matches!(
+            checker.check(
+                "Bash",
+                &json!({"command": "cargo test permissions -- --nocapture"}),
+                false
+            ),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("Bash", &json!({"command": "cargo build --release"}), false),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn nested_command_grants_are_bound_to_the_wrapper_environment() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        let command_type = bash_command_type("nix-shell shell-a.nix --run 'cargo test --lib'")
+            .expect("known nested command type");
+        checker.always_allow_command_type(&command_type.key);
+
+        assert!(matches!(
+            checker.check(
+                "Bash",
+                &json!({"command": "nix-shell shell-a.nix --run 'cargo test query'"}),
+                false
+            ),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check(
+                "Bash",
+                &json!({"command": "nix-shell shell-b.nix --run 'cargo test query'"}),
+                false
+            ),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn unsafe_or_compound_commands_keep_exact_scope() {
+        for command in [
+            "rm -rf target",
+            "git clean -fd",
+            "cargo test && git push",
+            "cargo test > results.txt",
+            "gh pr merge 42",
+            "RUSTC_WRAPPER=/tmp/wrapper cargo test",
+            "/tmp/cargo test",
+            "cargo --manifest-path test build",
+            "make -f test release",
+        ] {
+            assert_eq!(
+                PermissionResponse::always_allow_for("Bash", &json!({"command": command})),
+                PermissionResponse::AlwaysAllowCommand(command.to_string()),
+                "{command} must not receive a reusable command-type grant"
+            );
+        }
+    }
+
+    #[test]
+    fn always_allow_label_explains_the_actual_scope() {
+        assert_eq!(
+            PermissionResponse::always_allow_label(
+                "Bash",
+                &json!({"command": "cargo test permissions"})
+            ),
+            "(a)lways allow cargo test commands"
+        );
+        assert_eq!(
+            PermissionResponse::always_allow_label("Bash", &json!({"command": "rm -rf target"})),
+            "(a)lways allow this exact command"
+        );
     }
 
     #[test]

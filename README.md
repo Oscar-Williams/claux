@@ -6,7 +6,7 @@ A terminal-based AI coding assistant written in Rust. Streams responses, execute
 
 - **Streaming chat** with tool execution (Read, Write, Edit, Glob, Grep, Bash, WebFetch, Agent)
 - **Image input** — attach PNG, JPEG, GIF, or WebP files in the TUI/REPL or one-shot mode
-- **Interactive permissions** — prompts before writes, `y/n/a`; type a message at the prompt instead to deny the tool and steer the model with it
+- **Interactive permissions** — prompts before writes, `y/n/a`; `a` remembers a narrow command family such as `cargo test` when one can be identified safely, otherwise it remembers only the exact Bash command. Type a message at the prompt instead to deny the tool and steer the model with it
 - **Mid-turn steering** — type while claux is running tools and press Enter; the running tool is cancelled, remaining queued tools are skipped, and your message reaches the model immediately
 - **Interrupt anywhere** — Ctrl+C during a turn cancels it cleanly (in-flight tool calls are paired with interrupted results, so the conversation stays valid); press Ctrl+C twice within 2s to quit the app (Ctrl+D still exits immediately)
 - **Session persistence** — SQLite-backed with search; full transcripts including tool calls and results, so `/resume` and `--resume` restore exactly what the model saw. Histories from older versions are repaired on load

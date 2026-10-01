@@ -2078,6 +2078,9 @@ impl Engine {
                     PermissionResponse::AlwaysAllowCommand(command) => {
                         self.permissions.always_allow_command(&command);
                     }
+                    PermissionResponse::AlwaysAllowCommandType(command_type) => {
+                        self.permissions.always_allow_command_type(&command_type);
+                    }
                     _ => {}
                 }
                 self.execute_tool_reporting(index, name, input, tx, cancel)
@@ -2085,6 +2088,11 @@ impl Engine {
             }
             Ok(PermissionResponse::AlwaysAllowCommand(ref cmd)) => {
                 self.permissions.always_allow_command(cmd);
+                self.execute_tool_reporting(index, name, input, tx, cancel)
+                    .await
+            }
+            Ok(PermissionResponse::AlwaysAllowCommandType(ref command_type)) => {
+                self.permissions.always_allow_command_type(command_type);
                 self.execute_tool_reporting(index, name, input, tx, cancel)
                     .await
             }
