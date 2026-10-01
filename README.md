@@ -402,6 +402,7 @@ accordingly.
 | `/help` | Show available commands |
 | `/cost` | Token usage and estimated cost |
 | `/compact` | Summarize conversation to free context |
+| `/auto` | Toggle auto permission mode for this session |
 | `/context` | Show context utilization, threshold, and remaining headroom |
 | `/diff` | Show file changes made by the last turn |
 | `/undo-turn` | Safely undo the last turn's file changes |
@@ -422,7 +423,7 @@ Global: `~/.config/claux/config.toml`
 
 ```toml
 default_profile = "sonnet"
-permission_mode = "default"  # default | accept-edits | bypass | plan
+permission_mode = "default"  # default | accept-edits | auto | bypass | plan
 native_tool_filesystem_policy = "workspace_only" # workspace_only | unrestricted
 bash_filesystem_policy = "auto" # auto | workspace_write | unrestricted
 
@@ -622,12 +623,20 @@ warning.
 |------|-------|------------|------|
 | `default` | auto | prompt | prompt |
 | `accept-edits` | auto | auto | prompt |
+| `auto` | auto | auto | recognized development commands auto; other commands prompt |
 | `bypass` | auto | auto | auto |
 | `plan` | auto | denied | denied |
 
 In `accept-edits` mode, Agent, MCP, and other non-read-only tools still require
 explicit approval. Sub-agents inherit the parent permission mode; because they
 are non-interactive, operations that would require another prompt are denied.
+
+`auto` mode also runs conservative command families such as `cargo test`,
+`go test`, and read-only Git commands without prompting. It allows sub-agents,
+which inherit the same policy. Unknown or compound Bash commands, external
+mutations, MCP tools, and future mutating tools still require approval. Use
+`bypass` only when every tool call should run without a prompt. Permission
+rules and filesystem containment continue to apply in every mode.
 
 ### Permission rules
 

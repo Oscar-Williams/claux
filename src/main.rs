@@ -187,7 +187,7 @@ async fn run() -> Result<std::process::ExitCode> {
         config.permission_mode = serde_json::from_value(serde_json::Value::String(mode.clone()))
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Invalid permission mode {mode:?}; expected default, accept-edits, bypass, or plan"
+                    "Invalid permission mode {mode:?}; expected default, accept-edits, auto, bypass, or plan"
                 )
             })?;
     }

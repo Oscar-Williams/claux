@@ -136,10 +136,24 @@ pub enum PermissionMode {
     Default,
     /// Auto-allow file edits, still prompt for bash
     AcceptEdits,
+    /// Auto-allow edits and conservative development commands
+    Auto,
     /// Allow everything without prompting
     Bypass,
     /// Deny all write operations
     Plan,
+}
+
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "auto",
+            Self::Bypass => "bypass",
+            Self::Plan => "plan",
+        }
+    }
 }
 
 /// Result of a permission check.
@@ -471,6 +485,8 @@ impl PermissionPolicy {
 
 pub struct PermissionChecker {
     mode: PermissionMode,
+    /// Mode restored when an interactive `/auto` toggle is disabled.
+    auto_previous_mode: Option<PermissionMode>,
     /// Configured allow/deny/ask rules, evaluated before the mode.
     rules: PermissionRules,
     /// Tools the user has "always allowed" this session
@@ -485,6 +501,7 @@ impl PermissionChecker {
     pub fn new(mode: PermissionMode) -> Self {
         Self {
             mode,
+            auto_previous_mode: None,
             rules: PermissionRules::default(),
             session_allows: std::collections::HashSet::new(),
             bash_command_allows: std::collections::HashSet::new(),
@@ -499,6 +516,23 @@ impl PermissionChecker {
 
     pub fn mode(&self) -> PermissionMode {
         self.mode
+    }
+
+    /// Toggle the session-local auto mode, preserving the mode it replaced.
+    /// Returns true when auto mode is now enabled.
+    pub fn toggle_auto(&mut self) -> bool {
+        if self.mode == PermissionMode::Auto {
+            self.mode = self
+                .auto_previous_mode
+                .take()
+                .filter(|mode| *mode != PermissionMode::Auto)
+                .unwrap_or(PermissionMode::Default);
+            false
+        } else {
+            self.auto_previous_mode = Some(self.mode);
+            self.mode = PermissionMode::Auto;
+            true
+        }
     }
 
     /// The prompt a tool call would show if it needed confirmation.
@@ -648,6 +682,25 @@ impl PermissionChecker {
                         message: tool_name.to_string(),
                         diff: None,
                     }
+                }
+            }
+
+            PermissionMode::Auto => {
+                let recognized_bash = tool_name == "Bash"
+                    && input["command"]
+                        .as_str()
+                        .and_then(bash_command_type)
+                        .is_some();
+                if is_read_only
+                    || matches!(tool_name, "Write" | "Edit" | "Agent")
+                    || recognized_bash
+                {
+                    PermissionResult::Allow
+                } else {
+                    // Unknown Bash, MCP, and future mutating tools retain an
+                    // explicit permission boundary. This keeps Auto narrower
+                    // than Bypass as the tool surface grows.
+                    Self::ask_for(tool_name, input)
                 }
             }
 
@@ -833,6 +886,73 @@ mod tests {
             checker.check("github__delete_repository", &input, false),
             PermissionResult::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn auto_allows_edits_agents_and_known_development_commands() {
+        let checker = PermissionChecker::new(PermissionMode::Auto);
+
+        for (tool_name, input, is_read_only) in [
+            ("Write", json!({"file_path": "src/main.rs"}), false),
+            ("Edit", json!({"file_path": "src/main.rs"}), false),
+            ("Agent", json!({"prompt": "inspect the parser"}), false),
+            ("WebFetch", json!({"url": "https://example.com"}), true),
+            ("Bash", json!({"command": "cargo test permissions"}), false),
+            (
+                "Bash",
+                json!({"command": "nix-shell shell.nix --run 'cargo test --lib'"}),
+                false,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    checker.check(tool_name, &input, is_read_only),
+                    PermissionResult::Allow
+                ),
+                "{tool_name} should be allowed in auto mode"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_asks_for_unknown_compound_and_external_mutations() {
+        let checker = PermissionChecker::new(PermissionMode::Auto);
+
+        for (tool_name, input) in [
+            ("Bash", json!({"command": "rm -rf target"})),
+            ("Bash", json!({"command": "cargo test && git push"})),
+            ("Bash", json!({"command": "gh pr merge 42"})),
+            (
+                "github__delete_repository",
+                json!({"repository": "example/project"}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    checker.check(tool_name, &input, false),
+                    PermissionResult::Ask { .. }
+                ),
+                "{tool_name} should still prompt in auto mode"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_toggle_restores_the_previous_mode() {
+        let mut checker = PermissionChecker::new(PermissionMode::AcceptEdits);
+
+        assert!(checker.toggle_auto());
+        assert_eq!(checker.mode(), PermissionMode::Auto);
+        assert!(!checker.toggle_auto());
+        assert_eq!(checker.mode(), PermissionMode::AcceptEdits);
+    }
+
+    #[test]
+    fn configured_auto_toggle_falls_back_to_default() {
+        let mut checker = PermissionChecker::new(PermissionMode::Auto);
+
+        assert!(!checker.toggle_auto());
+        assert_eq!(checker.mode(), PermissionMode::Default);
     }
 
     #[test]

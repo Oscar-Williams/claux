@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long)]
     pub resume: Option<String>,
 
-    /// Permission mode (default, accept-edits, bypass, plan)
+    /// Permission mode (default, accept-edits, auto, bypass, plan)
     #[arg(long)]
     pub permission_mode: Option<String>,
 
