@@ -202,7 +202,12 @@ impl ChatApp {
     }
 
     fn save_session(&mut self, db: &Db, session_id: &str, engine: &Engine) -> bool {
-        self.record_save(db.save_snapshot(session_id, engine.messages(), engine.model_binding()))
+        self.record_save(db.save_conversation(
+            session_id,
+            engine.messages(),
+            engine.model_binding(),
+            engine.archive(),
+        ))
     }
 
     fn record_save(&mut self, result: Result<()>) -> bool {
@@ -504,6 +509,7 @@ async fn run_session(
     // pairing) before the engine sends them anywhere.
     let existing_messages = crate::session::repair_history(db.get_messages(session_id)?);
     engine.set_messages(existing_messages.clone());
+    engine.set_archive(db.get_archive(session_id)?);
 
     let mut app = ChatApp::new(engine.model(), theme);
     app.status = format!(

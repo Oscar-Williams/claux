@@ -53,6 +53,8 @@ pub struct OneShotTranscript<'a> {
     pub outcome: TranscriptOutcome<'a>,
     pub usage: UsageSummary,
     pub messages: &'a [Message],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<&'a [crate::session::ArchivedMessage]>,
     pub tool_trace: &'a [ToolTraceEntry],
     pub timing: ExecutionTiming,
 }
@@ -88,6 +90,7 @@ impl<'a> OneShotTranscript<'a> {
             outcome,
             usage: cost.usage_summary(),
             messages,
+            archive: None,
             tool_trace,
             timing,
         }
@@ -106,9 +109,14 @@ impl<'a> OneShotTranscript<'a> {
             outcome: TranscriptOutcome::Running,
             usage: cost.usage_summary(),
             messages,
+            archive: None,
             tool_trace,
             timing,
         }
+    }
+    pub fn with_archive(mut self, archive: &'a [crate::session::ArchivedMessage]) -> Self {
+        self.archive = Some(archive);
+        self
     }
 }
 

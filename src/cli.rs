@@ -64,6 +64,11 @@ pub enum OutputFormat {
 
 #[derive(Subcommand)]
 pub enum CliCommand {
+    /// Export the original conversation archive, independently of active context
+    Archive {
+        /// Session ID or unique prefix
+        session: String,
+    },
     /// Authenticate claux with a model provider
     Auth {
         #[command(subcommand)]
@@ -217,6 +222,13 @@ pub enum ConfigProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archive_accepts_a_session_prefix() {
+        let cli = Cli::try_parse_from(["claux", "archive", "20261002"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(CliCommand::Archive { session }) if session == "20261002")
+        );
+    }
     use super::*;
 
     #[test]

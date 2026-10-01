@@ -1,8 +1,8 @@
 //! Context estimation and task-preserving compaction helpers.
 //!
 //! Tool outputs are capped before entering history. Compaction summarizes the
-//! intact conversation and retains the original request verbatim; older context
-//! is never replaced by a marker before the model has summarized it.
+//! older conversation into a current task handoff and retains recent turns
+//! verbatim. Older context is never discarded before summarization succeeds.
 
 use crate::api::types::{ContentBlock, Message, MessageContent};
 
@@ -21,7 +21,7 @@ static TOKENIZER: LazyLock<CoreBPE> =
 static NO_SPECIAL: LazyLock<HashSet<&'static str>> = LazyLock::new(HashSet::new);
 
 /// Count tokens in a string using tiktoken.
-fn count_tokens(text: &str) -> usize {
+pub fn count_tokens(text: &str) -> usize {
     TOKENIZER.encode(text, &NO_SPECIAL).0.len()
 }
 
@@ -104,30 +104,122 @@ Distinguish completed work from plans. Later user instructions supersede earlier
 ones. Carry forward still-relevant details from any earlier handoff. Do not
 invent missing facts; use 'None' for empty sections. Keep it concise.";
 
-/// Pin the first actual user request, including attached images. Because this
-/// message remains first after compaction, repeated compaction and session resume
-/// retain it without separate metadata or a storage migration.
-pub fn original_request(messages: &[Message]) -> Option<Message> {
-    messages
-        .iter()
-        .find(|message| {
-            message.role == "user"
-                && match &message.content {
-                    MessageContent::Text(text) => !text.trim().is_empty(),
-                    MessageContent::Blocks(blocks) => {
-                        !blocks
-                            .iter()
-                            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-                            && blocks.iter().any(|block| {
-                                matches!(
-                                    block,
-                                    ContentBlock::Text { .. } | ContentBlock::Image { .. }
-                                )
-                            })
+pub const HANDOFF_INTRO: &str = "The following handoff summarizes earlier conversation. Follow its current objective and later corrections, then incorporate the recent messages that follow.";
+
+pub fn is_user_request(message: &Message) -> bool {
+    message.role == "user"
+        && match &message.content {
+            MessageContent::Text(text) => !text.trim().is_empty(),
+            MessageContent::Blocks(blocks) => {
+                !blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                    && blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text { .. } | ContentBlock::Image { .. }
+                        )
+                    })
+            }
+        }
+}
+
+/// Retain up to four recent user turns, or a suffix of a long tool loop.
+/// Never split an outstanding tool batch across the summary and retained tail.
+pub fn recent_tail_start(messages: &[Message], budget: usize) -> usize {
+    let mut pending = HashSet::new();
+    let mut boundaries = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 && pending.is_empty() {
+            boundaries.push(index);
+        }
+        if let MessageContent::Blocks(blocks) = &message.content {
+            for block in blocks {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        pending.insert(id.clone());
                     }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        pending.remove(tool_use_id);
+                    }
+                    _ => {}
                 }
-        })
-        .cloned()
+            }
+        }
+    }
+    let user_boundaries: Vec<_> = boundaries
+        .iter()
+        .copied()
+        .filter(|index| is_user_request(&messages[*index]))
+        .collect();
+    for index in user_boundaries.iter().rev().take(4).rev() {
+        if estimate_tokens(&messages[*index..]) <= budget {
+            return *index;
+        }
+    }
+    boundaries
+        .into_iter()
+        .find(|index| estimate_tokens(&messages[*index..]) <= budget)
+        .unwrap_or(messages.len())
+}
+
+/// Render tool activity as data rather than executable provider tool items.
+/// Images remain intact in the retained tail; never summarize base64 transport.
+pub fn summary_text(messages: &[Message]) -> String {
+    let mut text = String::new();
+    for message in messages {
+        text.push_str(&format!("\n[{}]\n", message.role));
+        match &message.content {
+            MessageContent::Text(value) => text.push_str(value),
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text: value } => text.push_str(value),
+                        ContentBlock::Image { .. } => text.push_str("[attached image]"),
+                        _ => text.push_str(
+                            &serde_json::to_string(block).expect("content block serializes"),
+                        ),
+                    }
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    text
+}
+
+/// Split large excerpts at UTF-8 boundaries, with an explicit token bound.
+pub fn text_chunks(text: &str, budget: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if count_tokens(rest) <= budget {
+            chunks.push(rest);
+            break;
+        }
+        let mut low = 0;
+        let mut high = rest.len();
+        while low < high {
+            let mut end = low + (high - low).div_ceil(2);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end <= low {
+                break;
+            }
+            if count_tokens(&rest[..end]) <= budget {
+                low = end;
+            } else {
+                high = end - 1;
+            }
+        }
+        if low == 0 {
+            low = rest.chars().next().unwrap().len_utf8();
+        }
+        chunks.push(&rest[..low]);
+        rest = &rest[low..];
+    }
+    chunks
 }
 
 /// Context window sizes for known models.
@@ -183,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn original_request_skips_tool_results_and_preserves_images() {
+    fn recent_tail_preserves_images_and_excludes_tool_results_as_user_turns() {
         let request = Message::user_with_images(
             "fix this screenshot",
             vec![crate::api::types::ImageSource {
@@ -193,19 +285,44 @@ mod tests {
             }],
         );
         let messages = vec![
-            Message::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: "old".into(),
-                content: "old output".into(),
-                is_error: None,
-            }]),
+            Message::user(&"old context ".repeat(100)),
             request.clone(),
             Message::assistant_text("working"),
         ];
         assert_eq!(
-            serde_json::to_value(original_request(&messages).unwrap()).unwrap(),
+            serde_json::to_value(&messages[recent_tail_start(&messages, 2048)]).unwrap(),
             serde_json::to_value(request).unwrap()
         );
-        assert!(original_request(&[]).is_none());
+        assert_eq!(recent_tail_start(&[], 2048), 0);
+    }
+
+    #[test]
+    fn recent_tail_does_not_orphan_tool_results() {
+        let messages = vec![
+            Message::user(&"old context ".repeat(100)),
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call".into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+            }]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "call".into(),
+                content: "result".into(),
+                is_error: None,
+            }]),
+            Message::assistant_text("done"),
+        ];
+        assert_eq!(recent_tail_start(&messages, 100), 1);
+        assert_eq!(recent_tail_start(&messages, 1), 3);
+    }
+
+    #[test]
+    fn oversized_excerpts_split_without_losing_unicode_or_content() {
+        let text = "λ界 text and paths /tmp/source.rs\n".repeat(100);
+        let chunks = text_chunks(&text, 64);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| count_tokens(chunk) <= 64));
+        assert_eq!(chunks.concat(), text);
     }
 
     #[test]

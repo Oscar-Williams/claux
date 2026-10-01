@@ -210,8 +210,13 @@ pub async fn run(
     if forced_shutdown || app_result.is_err() {
         if let (Some(session_id), Some(engine)) = (&active_session, &engine) {
             let messages = crate::session::repair_history(engine.messages().to_vec());
-            if let Err(error) = db.save_snapshot(session_id, &messages, engine.model_binding()) {
-                match crate::session::write_recovery(session_id, &messages, engine.model_binding()) {
+            if let Err(error) = db.save_conversation(
+                session_id,
+                &messages,
+                engine.model_binding(),
+                engine.archive(),
+            ) {
+                match crate::session::write_recovery(session_id, &messages, engine.model_binding(), engine.archive()) {
                     Ok(path) => eprintln!("Session save failed: {error}. Recovery JSON saved to {}. Copy it somewhere permanent; temporary files may be cleaned up.", path.display()),
                     Err(recovery_error) => eprintln!("Session save failed: {error}. Recovery export also failed: {recovery_error}. Unsaved messages could not be preserved."),
                 }

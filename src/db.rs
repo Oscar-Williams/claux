@@ -127,6 +127,28 @@ impl Db {
             [],
         )?;
 
+        let migration = conn.unchecked_transaction()?;
+        migration.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_archive (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                event_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                UNIQUE(session_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS archive_migrations (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            INSERT OR IGNORE INTO conversation_archive (session_id, event_id, message)
+            SELECT messages.session_id, 'legacy-' || messages.id,
+                json_object('role', messages.role, 'content', json(messages.content))
+            FROM messages JOIN sessions ON sessions.id = messages.session_id
+            WHERE NOT EXISTS (SELECT 1 FROM archive_migrations WHERE archive_migrations.session_id = messages.session_id)
+            ORDER BY messages.id;
+            INSERT OR IGNORE INTO archive_migrations SELECT id FROM sessions;"
+        )?;
+        migration.commit()?;
+
         // Older Claux versions left foreign-key enforcement disabled, so
         // remove any unreachable transcript rows they may have accumulated.
         conn.execute(
@@ -286,19 +308,53 @@ impl Db {
     /// rather than appending: compaction rewrites history and steering
     /// inserts messages mid-turn, so append-only saves drift from the
     /// engine's actual state.
+    #[cfg(test)]
     pub fn replace_messages(&self, session_id: &str, messages: &[Message]) -> Result<()> {
         self.save_snapshot(session_id, messages, None)
     }
 
     /// Save history and its credential-free model binding atomically.
+    #[cfg(test)]
     pub fn save_snapshot(
         &self,
         session_id: &str,
         messages: &[Message],
         binding: Option<&ModelBinding>,
     ) -> Result<()> {
+        self.save_conversation(session_id, messages, binding, &[])
+    }
+
+    /// Append original conversation events and replace active context atomically.
+    pub fn save_conversation(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        binding: Option<&ModelBinding>,
+        archive: &[crate::session::ArchivedMessage],
+    ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO conversation_archive
+                (session_id, event_id, message) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut existing = tx.prepare(
+                "SELECT message FROM conversation_archive WHERE session_id = ?1 AND event_id = ?2",
+            )?;
+            for event in archive {
+                let serialized = serde_json::to_string(&event.message)?;
+                stmt.execute((session_id, &event.id, &serialized))?;
+                let saved: String =
+                    existing.query_row((session_id, &event.id), |row| row.get(0))?;
+                anyhow::ensure!(
+                    saved == serialized,
+                    "Archive event {} changed; session save rolled back",
+                    event.id
+                );
+            }
+        }
 
         tx.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
         {
@@ -318,6 +374,10 @@ impl Db {
             (messages.len() as i64, session_id),
         )?;
         anyhow::ensure!(updated == 1, "Session no longer exists: {session_id}");
+        tx.execute(
+            "INSERT OR IGNORE INTO archive_migrations (session_id) VALUES (?1)",
+            [session_id],
+        )?;
         if let Some(binding) = binding {
             tx.execute(
                 "UPDATE sessions SET model = ?1, model_profile = ?2, model_binding = ?3 WHERE id = ?4",
@@ -366,6 +426,28 @@ impl Db {
         })?;
 
         Ok(messages.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_archive(&self, session_id: &str) -> Result<Vec<crate::session::ArchivedMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, message FROM conversation_archive
+            WHERE session_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            let message: String = row.get(1)?;
+            Ok(crate::session::ArchivedMessage {
+                id: row.get(0)?,
+                message: serde_json::from_str(&message).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Delete a session and all its messages.
@@ -428,6 +510,85 @@ fn parse_model_binding(json: Option<String>) -> Option<ModelBinding> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archive_survives_compaction_resume_and_repeated_saves() {
+        use crate::session::ArchivedMessage;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sessions.db");
+        let db = Db::open(&path).unwrap();
+        db.create_session("s", "test", None, None).unwrap();
+        let mut archive = vec![
+            ArchivedMessage::new(Message::user("old request")),
+            ArchivedMessage::new(Message::assistant_text("original answer")),
+        ];
+        let original: Vec<_> = archive.iter().map(|event| event.message.clone()).collect();
+        db.save_conversation("s", &original, None, &archive)
+            .unwrap();
+        let compacted = vec![
+            Message::user(crate::compact::HANDOFF_INTRO),
+            Message::assistant_text("current task"),
+        ];
+        db.save_conversation("s", &compacted, None, &archive)
+            .unwrap();
+        assert_eq!(db.get_messages("s").unwrap().len(), 2);
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        archive = db.get_archive("s").unwrap();
+        assert_eq!(
+            serde_json::to_value(&archive[0].message).unwrap(),
+            serde_json::to_value(&original[0]).unwrap()
+        );
+        archive.push(ArchivedMessage::new(Message::user("later correction")));
+        db.save_conversation("s", &compacted, None, &archive)
+            .unwrap();
+        db.save_conversation("s", &compacted, None, &archive)
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_archive("s").unwrap()).unwrap(),
+            serde_json::to_value(&archive).unwrap()
+        );
+        db.delete_session("s").unwrap();
+        assert!(db.get_archive("s").unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_event_changes_roll_back_the_entire_save() {
+        use crate::session::ArchivedMessage;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&dir.path().join("sessions.db")).unwrap();
+        db.create_session("s", "test", None, None).unwrap();
+        let original = vec![Message::user("original")];
+        let mut archive = vec![ArchivedMessage::new(original[0].clone())];
+        db.save_conversation("s", &original, None, &archive)
+            .unwrap();
+        archive[0].message = Message::user("changed");
+        assert!(db.save_conversation("s", &[], None, &archive).is_err());
+        assert_eq!(db.get_messages("s").unwrap().len(), 1);
+        assert!(
+            matches!(&db.get_archive("s").unwrap()[0].message.content, crate::api::types::MessageContent::Text(text) if text == "original")
+        );
+    }
+
+    #[test]
+    fn legacy_history_is_archived_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sessions.db");
+        let db = Db::open(&path).unwrap();
+        db.create_session("s", "test", None, None).unwrap();
+        db.append_message("s", &Message::user("legacy conversation"))
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let archive = db.get_archive("s").unwrap();
+        assert_eq!(archive.len(), 1);
+        assert!(archive[0].id.starts_with("legacy-"));
+        db.replace_messages("s", &[Message::assistant_text("summary")])
+            .unwrap();
+        drop(db);
+        assert_eq!(Db::open(&path).unwrap().get_archive("s").unwrap().len(), 1);
+    }
     use super::*;
     use crate::config::{OpenAIProtocol, ProviderKind};
     use tempfile::TempDir;

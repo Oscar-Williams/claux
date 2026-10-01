@@ -152,6 +152,7 @@ pub async fn run(
                             .await?;
                             resumed_engine.set_system_prompt(system_prompt);
                             resumed_engine.set_messages(messages);
+                            resumed_engine.set_archive(session::load_archive(&path)?);
                             engine.jobs().shutdown().await;
                             engine = resumed_engine;
                             session_path = path;
@@ -196,6 +197,7 @@ pub async fn run(
                                 .await?;
                                 next_engine.set_system_prompt(system_prompt);
                                 next_engine.set_messages(messages);
+                                next_engine.set_archive(engine.archive().to_vec());
                                 Ok::<_, anyhow::Error>(next_engine)
                             }
                             .await;
@@ -228,7 +230,7 @@ pub async fn run(
                         Err(e) => eprintln!("\x1b[31mError: {e}\x1b[0m"),
                     }
                     // Commands like /compact rewrite engine history
-                    let _ = session::save_messages(&session_path, engine.messages());
+                    save_session(&session_path, &engine);
                     if let Some(binding) = engine.model_binding() {
                         let _ = session::save_model_binding(&session_path, binding);
                     }
@@ -432,9 +434,7 @@ pub async fn run(
         // Snapshot the full conversation, tool rounds included. Previously
         // only the final assistant message was saved, so resumed sessions
         // lost everything the turn actually did.
-        if let Err(e) = session::save_messages(&session_path, engine.messages()) {
-            tracing::warn!("Failed to save session: {e}");
-        }
+        save_session(&session_path, &engine);
 
         if exit_app {
             println!("\n\x1b[2mTurn abandoned; exiting.\x1b[0m");
@@ -446,6 +446,16 @@ pub async fn run(
     println!("Goodbye!");
     engine.jobs().shutdown().await;
     Ok(())
+}
+
+fn save_session(path: &std::path::Path, engine: &Engine) {
+    if let Err(error) = session::save_engine(path, engine) {
+        eprintln!("Session is UNSAVED: {error}");
+        match session::write_engine_recovery(path, engine) {
+            Ok(recovery) => eprintln!("Recovery JSON saved to {}. Copy it somewhere permanent; temporary files may be cleaned up.", recovery.display()),
+            Err(recovery_error) => eprintln!("Recovery export also failed: {recovery_error}. Keep this chat open and retry saving."),
+        }
+    }
 }
 
 /// Render the tail of a conversation for display after a resume: user

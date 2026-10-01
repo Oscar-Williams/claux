@@ -10,6 +10,21 @@ use crate::api::types::Message;
 use crate::config::{ModelBinding, ResolvedModel};
 use crate::db::Db;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ArchivedMessage {
+    pub id: String,
+    pub message: Message,
+}
+
+impl ArchivedMessage {
+    pub fn new(message: Message) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            message,
+        }
+    }
+}
+
 /// Get the database path.
 pub(crate) fn db_path() -> Result<PathBuf> {
     let base =
@@ -40,6 +55,7 @@ pub(crate) fn write_recovery(
     session_id: &str,
     messages: &[Message],
     binding: Option<&ModelBinding>,
+    archive: &[ArchivedMessage],
 ) -> Result<PathBuf> {
     use std::io::Write;
     let path = std::env::temp_dir().join(format!("claux-recovery-{}.json", uuid::Uuid::new_v4()));
@@ -54,7 +70,8 @@ pub(crate) fn write_recovery(
     serde_json::to_writer(
         &mut file,
         &serde_json::json!({
-            "session_id": session_id, "messages": messages, "model_binding": binding
+            "session_id": session_id, "messages": messages, "model_binding": binding,
+            "archive": archive
         }),
     )?;
     file.flush()?;
@@ -89,11 +106,26 @@ pub(crate) fn new_session_id() -> String {
 /// Called after each turn with the engine's message list. Snapshotting
 /// (rather than appending) keeps the store faithful to the engine even
 /// when compaction rewrites history or steering inserts messages mid-turn.
-pub fn save_messages(path: &std::path::Path, messages: &[Message]) -> Result<()> {
-    let session_id = extract_session_id(path);
-    let db = get_db()?;
-    db.replace_messages(&session_id, messages)?;
-    Ok(())
+pub fn save_engine(path: &Path, engine: &crate::query::Engine) -> Result<()> {
+    get_db()?.save_conversation(
+        &extract_session_id(path),
+        engine.messages(),
+        engine.model_binding(),
+        engine.archive(),
+    )
+}
+
+pub fn load_archive(path: &Path) -> Result<Vec<ArchivedMessage>> {
+    get_db()?.get_archive(&extract_session_id(path))
+}
+
+pub fn write_engine_recovery(path: &Path, engine: &crate::query::Engine) -> Result<PathBuf> {
+    write_recovery(
+        &extract_session_id(path),
+        engine.messages(),
+        engine.model_binding(),
+        engine.archive(),
+    )
 }
 
 pub fn save_model_binding(path: &std::path::Path, binding: &ModelBinding) -> Result<()> {
@@ -308,11 +340,18 @@ mod tests {
     #[test]
     fn recovery_export_preserves_messages_in_a_private_unique_file() {
         let messages = vec![Message::user("recover me 界")];
-        let path = write_recovery("test-session", &messages, None).unwrap();
+        let archive = vec![ArchivedMessage::new(Message::user(
+            "original conversation before compaction",
+        ))];
+        let path = write_recovery("test-session", &messages, None, &archive).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["session_id"], "test-session");
         assert_eq!(value["messages"][0]["content"], "recover me 界");
+        assert_eq!(
+            value["archive"][0]["message"]["content"],
+            "original conversation before compaction"
+        );
         assert!(value["model_binding"].is_null());
         #[cfg(unix)]
         {
