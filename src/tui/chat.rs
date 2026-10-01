@@ -78,7 +78,7 @@ pub struct ChatApp {
     pub status: String,
     pub permission_prompt: Option<String>,
     pub permission_details: Option<Vec<String>>,
-    pub permission_always_is_command: bool,
+    pub permission_always_label: Option<String>,
     pub should_exit: bool,
     pub should_go_home: bool,
     pub model: String,
@@ -123,7 +123,7 @@ impl ChatApp {
             status: String::new(),
             permission_prompt: None,
             permission_details: None,
-            permission_always_is_command: false,
+            permission_always_label: None,
             should_exit: false,
             should_go_home: false,
             model: model.to_string(),
@@ -1022,7 +1022,7 @@ async fn prompt_permission_tui<B: ratatui::backend::Backend>(
             .map(|line| crate::utils::sanitize_terminal_text(&line))
             .collect(),
     );
-    app.permission_always_is_command = tool_name == "Bash";
+    app.permission_always_label = Some(PermissionResponse::always_allow_label(tool_name, input));
     app.mode = Mode::Permission;
     terminal.draw(|f| ui::draw_chat(f, app))?;
 
@@ -1081,7 +1081,7 @@ async fn prompt_permission_tui<B: ratatui::backend::Backend>(
 
     app.permission_prompt = None;
     app.permission_details = None;
-    app.permission_always_is_command = false;
+    app.permission_always_label = None;
     app.mode = Mode::Streaming;
     app.status = app.model.clone();
     Ok(response)
@@ -2332,6 +2332,8 @@ mod tuishot_shots {
                         "".to_string(),
                         "Working directory: /home/user/dev/claux".to_string(),
                     ]);
+                    app.permission_always_label =
+                        Some("(a)lways allow cargo test commands".to_string());
                     app
                 }
                 ChatShot::ToolRunning | ChatShot::ToolQueued | ChatShot::ToolOutput => {

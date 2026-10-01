@@ -354,7 +354,7 @@ pub async fn run(
                                     println!();
                                     in_tool = false;
                                 }
-                                print_permission_prompt(&tool_name, &summary);
+                                print_permission_prompt(&tool_name, &summary, &input);
                                 let line = tokio::select! {
                                     line = stdin_rx.recv() => line,
                                     _ = tokio::signal::ctrl_c() => {
@@ -380,7 +380,12 @@ pub async fn run(
                                     println!();
                                     in_tool = false;
                                 }
-                                print_permission_prompt_with_diff(&tool_name, &summary, &diff);
+                                print_permission_prompt_with_diff(
+                                    &tool_name,
+                                    &summary,
+                                    &diff,
+                                    &input,
+                                );
                                 let line = tokio::select! {
                                     line = stdin_rx.recv() => line,
                                     _ = tokio::signal::ctrl_c() => {
@@ -499,29 +504,24 @@ fn replay_transcript(messages: &[crate::api::Message], model: &str, keep: usize)
 
 /// Print the permission question for a tool. The answer is read from the
 /// stdin channel by the caller.
-fn print_permission_prompt(tool_name: &str, summary: &str) {
+fn print_permission_prompt(tool_name: &str, summary: &str, input: &serde_json::Value) {
     let summary = crate::utils::sanitize_terminal_text(summary);
-    if tool_name == "Bash" {
-        print!(
-            "\n  \x1b[33m⚡ {summary}\x1b[0m  \x1b[2m(y)es / (n)o / (a)lways this command\x1b[0m "
-        );
-    } else {
-        print!("\n  \x1b[33m⚡ {summary}\x1b[0m  \x1b[2m(y)es / (n)o / (a)lways\x1b[0m ");
-    }
+    let always = PermissionResponse::always_allow_label(tool_name, input);
+    print!("\n  \x1b[33m⚡ {summary}\x1b[0m  \x1b[2m(y)es / (n)o / {always}\x1b[0m ");
     let _ = stdout().flush();
 }
 
 /// Print the permission question with a diff preview.
-fn print_permission_prompt_with_diff(tool_name: &str, summary: &str, diff: &str) {
+fn print_permission_prompt_with_diff(
+    tool_name: &str,
+    summary: &str,
+    diff: &str,
+    input: &serde_json::Value,
+) {
     let summary = crate::utils::sanitize_terminal_text(summary);
     let diff = crate::utils::sanitize_terminal_text(diff);
-    if tool_name == "Bash" {
-        println!(
-            "\n  \x1b[33m⚡ {summary}\x1b[0m  \x1b[2m(y)es / (n)o / (a)lways this command\x1b[0m"
-        );
-    } else {
-        println!("\n  \x1b[33m⚡ {summary}\x1b[0m  \x1b[2m(y)es / (n)o / (a)lways\x1b[0m");
-    }
+    let always = PermissionResponse::always_allow_label(tool_name, input);
+    println!("\n  \x1b[33m⚡ {summary}\x1b[0m  \x1b[2m(y)es / (n)o / {always}\x1b[0m");
     println!("\n  \x1b[2m--- Diff Preview ---\x1b[0m");
 
     let colored_diff = colorize_diff(&diff);
@@ -606,10 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn permission_always_is_command_specific_for_bash() {
+    fn permission_always_uses_command_type_for_known_bash_commands() {
         assert_eq!(
             parse_permission_response("Bash", &serde_json::json!({"command": "cargo test"}), "a\n"),
-            PermissionResponse::AlwaysAllowCommand("cargo test".to_string())
+            PermissionResponse::AlwaysAllowCommandType("cargo:test".to_string())
         );
     }
 

@@ -506,11 +506,10 @@ fn draw_input_and_status(
             perm_lines.push(Line::from(Span::styled(detail.clone(), style)));
         }
         perm_lines.push(Line::from(""));
-        let always_label = if app.permission_always_is_command {
-            "(a)lways allow this command"
-        } else {
-            "(a)lways allow"
-        };
+        let always_label = app
+            .permission_always_label
+            .as_deref()
+            .unwrap_or("(a)lways allow this tool");
         perm_lines.push(Line::from(vec![
             Span::styled("  (y)es  ", Style::default().fg(app.theme.success)),
             Span::styled("(n)o  ", Style::default().fg(app.theme.error)),
