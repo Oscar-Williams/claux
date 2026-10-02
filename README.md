@@ -57,7 +57,8 @@ cargo install claux
 cargo install --path .
 ```
 
-Requires Rust 1.88+. A `shell.nix` is included.
+Requires Rust 1.88+. The included `shell.nix` uses the latest stable toolchain,
+matching CI.
 
 Every release publishes a `SHA256SUMS` file and a `<asset>.sha256` next to
 each binary. Verify a download before running it:
