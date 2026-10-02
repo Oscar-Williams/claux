@@ -180,7 +180,7 @@ fn run_credential_command(
 
 impl ResolvedModel {
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(key) = self.api_key.as_deref().filter(|key| !key.is_empty()) {
+        if let Some(key) = self.api_key.as_deref().filter(|key| !key.trim().is_empty()) {
             return Some(key.to_string());
         }
         if let Some(command) = self.api_key_cmd.as_deref() {
@@ -200,25 +200,18 @@ impl ResolvedModel {
         }
         std::env::var(&self.binding.api_key_env)
             .ok()
-            .filter(|key| !key.is_empty())
+            .filter(|key| !key.trim().is_empty())
             .or_else(|| {
-                let name = self.binding.provider_name.to_ascii_lowercase();
-                let is_openrouter = name == "openrouter"
-                    || self
-                        .binding
-                        .base_url
-                        .as_deref()
-                        .is_some_and(|url| url.contains("openrouter.ai"));
-                let provider = self.binding.provider.to_ascii_lowercase();
-                let credential_provider = if is_openrouter {
-                    Some("openrouter")
-                } else if matches!(provider.as_str(), "opencode" | "opencode-go") {
-                    Some("opencode-go")
-                } else if matches!(provider.as_str(), "vercel" | "vercel-ai-gateway") {
-                    Some("vercel")
-                } else {
-                    None
-                }?;
+                let descriptor = crate::providers::for_binding(&self.binding)?;
+                if self.binding.api_key_env == descriptor.api_key_env {
+                    if let Some(key) = descriptor.environment_key() {
+                        return Some(key);
+                    }
+                }
+                if descriptor.auth == crate::providers::AuthFlow::None {
+                    return None;
+                }
+                let credential_provider = descriptor.id;
                 match crate::auth::read_provider_key(credential_provider) {
                     Ok(key) => key,
                     Err(error) => {
@@ -233,17 +226,9 @@ impl ResolvedModel {
     }
 
     pub fn requires_api_key(&self) -> bool {
-        match self.binding.provider_kind {
-            ProviderKind::Anthropic => true,
-            ProviderKind::Openai => {
-                matches!(
-                    self.binding.provider_name.to_ascii_lowercase().as_str(),
-                    "openai" | "openrouter"
-                ) || self.binding.base_url.as_deref().is_some_and(|url| {
-                    url.contains("api.openai.com") || url.contains("openrouter.ai")
-                })
-            }
-        }
+        crate::providers::for_binding(&self.binding)
+            .map(|descriptor| descriptor.requires_api_key)
+            .unwrap_or(self.binding.provider_kind == ProviderKind::Anthropic)
     }
 }
 
@@ -480,11 +465,17 @@ fn default_model() -> String {
 }
 
 fn default_api_key_env() -> String {
-    "ANTHROPIC_API_KEY".to_string()
+    crate::providers::BuiltinProvider::Anthropic
+        .descriptor()
+        .api_key_env
+        .to_string()
 }
 
 fn default_openai_api_key_env() -> String {
-    "OPENAI_API_KEY".to_string()
+    crate::providers::BuiltinProvider::Openai
+        .descriptor()
+        .api_key_env
+        .to_string()
 }
 
 fn default_max_tokens() -> u32 {
@@ -639,10 +630,27 @@ impl Config {
                 profile.provider
             )
         })?;
-        let default_env = match provider.kind {
-            ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-            ProviderKind::Openai => "OPENAI_API_KEY",
-        };
+        let descriptor = crate::providers::identify(
+            provider.kind,
+            provider.name.as_deref().unwrap_or(&profile.provider),
+            &profile.provider,
+            provider.base_url.as_deref(),
+        );
+        let default_env =
+            descriptor
+                .map(|p| p.api_key_env)
+                .unwrap_or_else(|| match provider.kind {
+                    ProviderKind::Anthropic => {
+                        crate::providers::BuiltinProvider::Anthropic
+                            .descriptor()
+                            .api_key_env
+                    }
+                    ProviderKind::Openai => {
+                        crate::providers::BuiltinProvider::Openai
+                            .descriptor()
+                            .api_key_env
+                    }
+                });
         let base_url = match provider.kind {
             // Anthropic-compatible gateways may expose the Messages API at a
             // custom root. A missing URL retains the official Anthropic API.
@@ -743,18 +751,6 @@ impl Config {
                 .and_then(|profile| profile.pricing)
                 .or(legacy_pricing),
         )
-    }
-
-    /// Whether the configured OpenAI-compatible endpoint is a hosted
-    /// provider that cannot be used anonymously.
-    #[cfg(test)]
-    pub fn openai_requires_api_key(&self) -> bool {
-        self.openai_provider_name.as_deref().is_some_and(|name| {
-            matches!(name.to_ascii_lowercase().as_str(), "openai" | "openrouter")
-        }) || self
-            .openai_base_url
-            .as_deref()
-            .is_some_and(|url| url.contains("api.openai.com") || url.contains("openrouter.ai"))
     }
 
     /// Whether the current project is trusted. Falls back to `false` (the
@@ -1202,13 +1198,20 @@ name = "ollama"
         for (name, url) in [
             ("openai", "https://api.openai.com/v1"),
             ("openrouter", "https://openrouter.ai/api/v1"),
+            ("opencode-go", "https://opencode.ai/zen/go/v1"),
+            ("opencode", "https://opencode.ai/zen/go/v1"),
+            ("vercel", "https://ai-gateway.vercel.sh/v1"),
+            ("vercel-ai-gateway", "https://ai-gateway.vercel.sh/v1"),
         ] {
             let config = Config {
                 openai_provider_name: Some(name.to_string()),
                 openai_base_url: Some(url.to_string()),
                 ..Config::default()
             };
-            assert!(config.openai_requires_api_key());
+            assert!(config
+                .resolve_model(&config.model)
+                .unwrap()
+                .requires_api_key());
         }
 
         let ollama = Config {
@@ -1216,7 +1219,88 @@ name = "ollama"
             openai_base_url: Some("http://localhost:11434/v1".to_string()),
             ..Config::default()
         };
-        assert!(!ollama.openai_requires_api_key());
+        assert!(!ollama
+            .resolve_model(&ollama.model)
+            .unwrap()
+            .requires_api_key());
+    }
+
+    #[test]
+    fn registry_defaults_preserve_explicit_transport_and_credentials() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.vercel]
+            type = "openai"
+            name = "Company Gateway"
+            base_url = "http://custom.invalid/api"
+            protocol = "responses"
+            api_key_env = "COMPANY_TEST_KEY"
+            api_key = "configured-key"
+            prompt_caching = true
+            allow_eof_without_finish_reason = true
+            [model_profiles.coder]
+            provider = "vercel"
+            model = "custom-model"
+        "#,
+        )
+        .unwrap();
+        let resolved = config.resolve_model("coder").unwrap();
+        assert_eq!(
+            resolved.binding.base_url.as_deref(),
+            Some("http://custom.invalid/api")
+        );
+        assert_eq!(resolved.binding.protocol, OpenAIProtocol::Responses);
+        assert_eq!(resolved.binding.api_key_env, "COMPANY_TEST_KEY");
+        assert_eq!(
+            resolved.resolve_api_key().as_deref(),
+            Some("configured-key")
+        );
+        assert!(resolved.binding.prompt_caching);
+        assert!(resolved.binding.allow_eof_without_finish_reason);
+        assert!(resolved.requires_api_key());
+    }
+
+    #[test]
+    fn named_profiles_use_registry_key_defaults_and_generic_endpoints_remain_keyless() {
+        for descriptor in crate::providers::PROVIDERS {
+            let config: Config = toml::from_str(&format!(
+                r#"
+                [providers.{}]
+                type = "{}"
+                base_url = "{}"
+                [model_profiles.test]
+                provider = "{}"
+                model = "test-model"
+            "#,
+                descriptor.id,
+                if descriptor.kind == ProviderKind::Anthropic {
+                    "anthropic"
+                } else {
+                    "openai"
+                },
+                descriptor.base_url,
+                descriptor.id
+            ))
+            .unwrap();
+            let resolved = config.resolve_model("test").unwrap();
+            assert_eq!(resolved.binding.api_key_env, descriptor.api_key_env);
+            assert_eq!(resolved.requires_api_key(), descriptor.requires_api_key);
+        }
+        for url in [
+            "http://localhost:8080/v1",
+            "https://example.invalid/api",
+            "https://openrouter.ai.evil.test/v1",
+            "https://example.invalid/openrouter.ai",
+        ] {
+            let config = Config {
+                openai_base_url: Some(url.to_string()),
+                openai_provider_name: Some("custom".into()),
+                ..Config::default()
+            };
+            let resolved = config.resolve_model(&config.model).unwrap();
+            assert!(!resolved.requires_api_key(), "{url}");
+            assert!(crate::providers::for_binding(&resolved.binding).is_none());
+        }
     }
 
     #[test]

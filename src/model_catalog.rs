@@ -83,17 +83,9 @@ fn with_context_window(mut metadata: ModelMetadata, context_window: usize) -> Mo
 }
 
 fn is_openrouter(resolved: &ResolvedModel) -> bool {
-    resolved
-        .binding
-        .provider_name
-        .eq_ignore_ascii_case("openrouter")
-        || resolved
-            .binding
-            .base_url
-            .as_deref()
-            .and_then(|url| reqwest::Url::parse(url).ok())
-            .and_then(|url| url.host_str().map(str::to_string))
-            .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+    crate::providers::for_binding(&resolved.binding).is_some_and(|descriptor| {
+        descriptor.catalog == Some(crate::providers::CatalogIntegration::OpenRouter)
+    })
 }
 
 async fn fetch_openrouter_context_window(resolved: &ResolvedModel) -> anyhow::Result<usize> {

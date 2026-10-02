@@ -311,61 +311,22 @@ struct ProviderSpecification<'a> {
 
 impl<'a> ProviderSpecification<'a> {
     fn new(provider: ConfigProvider, model: Option<&'a str>) -> Self {
-        match provider {
-            ConfigProvider::Anthropic => Self {
-                id: "anthropic",
-                kind: "anthropic",
-                base_url: None,
-                protocol: "chat_completions",
-                api_key_env: "ANTHROPIC_API_KEY",
-                prompt_caching: false,
-                model: model.unwrap_or("claude-sonnet-5"),
+        let descriptor = provider.descriptor();
+        Self {
+            id: descriptor.id,
+            kind: match descriptor.kind {
+                ProviderKind::Anthropic => "anthropic",
+                ProviderKind::Openai => "openai",
             },
-            ConfigProvider::Openai => Self {
-                id: "openai",
-                kind: "openai",
-                base_url: Some("https://api.openai.com/v1"),
-                protocol: "responses",
-                api_key_env: "OPENAI_API_KEY",
-                prompt_caching: false,
-                model: model.unwrap_or("gpt-5.6-sol"),
+            // Preserve the existing Anthropic template's implicit official URL.
+            base_url: (descriptor.kind != ProviderKind::Anthropic).then_some(descriptor.base_url),
+            protocol: match descriptor.protocol {
+                crate::config::OpenAIProtocol::ChatCompletions => "chat_completions",
+                crate::config::OpenAIProtocol::Responses => "responses",
             },
-            ConfigProvider::OpenRouter => Self {
-                id: "openrouter",
-                kind: "openai",
-                base_url: Some("https://openrouter.ai/api/v1"),
-                protocol: "chat_completions",
-                api_key_env: "OPENROUTER_API_KEY",
-                prompt_caching: true,
-                model: model.unwrap_or("anthropic/claude-sonnet-5"),
-            },
-            ConfigProvider::OpenCodeGo => Self {
-                id: "opencode-go",
-                kind: "openai",
-                base_url: Some("https://opencode.ai/zen/go/v1"),
-                protocol: "chat_completions",
-                api_key_env: "OPENCODE_GO_API_KEY",
-                prompt_caching: false,
-                model: model.unwrap_or("glm-5.3"),
-            },
-            ConfigProvider::Vercel => Self {
-                id: "vercel",
-                kind: "openai",
-                base_url: Some("https://ai-gateway.vercel.sh/v1"),
-                protocol: "chat_completions",
-                api_key_env: "AI_GATEWAY_API_KEY",
-                prompt_caching: false,
-                model: model.unwrap_or("zai/glm-5.3-flash"),
-            },
-            ConfigProvider::Ollama => Self {
-                id: "ollama",
-                kind: "openai",
-                base_url: Some("http://localhost:11434/v1"),
-                protocol: "chat_completions",
-                api_key_env: "OLLAMA_API_KEY",
-                prompt_caching: false,
-                model: model.unwrap_or("llama3"),
-            },
+            api_key_env: descriptor.api_key_env,
+            prompt_caching: descriptor.prompt_caching,
+            model: model.unwrap_or(descriptor.default_model),
         }
     }
 }
@@ -538,7 +499,19 @@ async fn check_provider(
         .build()?;
     let request = match model.binding.provider_kind {
         ProviderKind::Anthropic => client
-            .get("https://api.anthropic.com/v1/models?limit=1")
+            .get(format!(
+                "{}/models?limit=1",
+                model
+                    .binding
+                    .base_url
+                    .as_deref()
+                    .unwrap_or(
+                        crate::providers::BuiltinProvider::Anthropic
+                            .descriptor()
+                            .base_url
+                    )
+                    .trim_end_matches('/')
+            ))
             .header("anthropic-version", "2023-06-01")
             .header(
                 "x-api-key",
@@ -681,18 +654,18 @@ mod tests {
 
     #[test]
     fn every_init_template_parses() {
-        for provider in [
-            ConfigProvider::Anthropic,
-            ConfigProvider::Openai,
-            ConfigProvider::OpenRouter,
-            ConfigProvider::OpenCodeGo,
-            ConfigProvider::Vercel,
-            ConfigProvider::Ollama,
-        ] {
+        for descriptor in crate::providers::PROVIDERS {
+            let provider = descriptor.provider;
             let parsed: Config = toml::from_str(&config_template(provider, None)).unwrap();
             assert_eq!(parsed.model_profiles.len(), 1);
             assert_eq!(parsed.providers.len(), 1);
             assert!(parsed.default_profile.is_some());
+            let resolved = parsed
+                .resolve_model(parsed.default_profile.as_deref().unwrap())
+                .unwrap();
+            assert_eq!(resolved.binding.api_key_env, descriptor.api_key_env);
+            assert_eq!(resolved.binding.protocol, descriptor.protocol);
+            assert_eq!(resolved.requires_api_key(), descriptor.requires_api_key);
             assert_eq!(
                 parsed.native_tool_filesystem_policy,
                 crate::sandbox::NativeToolFilesystemPolicy::WorkspaceOnly
@@ -701,6 +674,74 @@ mod tests {
                 parsed.bash_filesystem_policy,
                 crate::command_sandbox::BashFilesystemPolicy::Auto
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_contacts_configured_endpoint_with_protocol_authentication() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for kind in [ProviderKind::Anthropic, ProviderKind::Openai] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/custom/v1/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 1024];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&bytes[..count]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                String::from_utf8(request).unwrap().to_ascii_lowercase()
+            });
+            let config: Config = toml::from_str(&format!(
+                r#"
+                [providers.gateway]
+                type = "{}"
+                base_url = "{base}"
+                [model_profiles.test]
+                provider = "gateway"
+                model = "test-model"
+            "#,
+                if kind == ProviderKind::Anthropic {
+                    "anthropic"
+                } else {
+                    "openai"
+                }
+            ))
+            .unwrap();
+            let model = config.resolve_model("test").unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                assert_eq!(
+                    check_provider(&model, Some("test-key")).await.unwrap(),
+                    reqwest::StatusCode::OK
+                );
+                server.await.unwrap()
+            })
+            .await
+            .unwrap();
+            match kind {
+                ProviderKind::Anthropic => {
+                    assert!(request.starts_with("get /custom/v1/models?limit=1 http/1.1"));
+                    assert!(request.contains("x-api-key: test-key"));
+                    assert!(request.contains("anthropic-version: 2023-06-01"));
+                    assert!(!request.contains("authorization:"));
+                }
+                ProviderKind::Openai => {
+                    assert!(request.starts_with("get /custom/v1/models http/1.1"));
+                    assert!(request.contains("authorization: bearer test-key"));
+                    assert!(!request.contains("x-api-key:"));
+                }
+            }
         }
     }
 

@@ -10,8 +10,17 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use url::Url;
 
-const OPENROUTER_AUTH_URL: &str = "https://openrouter.ai/auth";
-const OPENROUTER_EXCHANGE_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
+use crate::providers::BuiltinProvider;
+
+fn openrouter_base() -> &'static str {
+    BuiltinProvider::OpenRouter.descriptor().base_url
+}
+
+fn openrouter_auth_url() -> Result<Url> {
+    let mut url = Url::parse(openrouter_base())?;
+    url.set_path("/auth");
+    Ok(url)
+}
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Serialize)]
@@ -66,21 +75,6 @@ pub async fn login_openrouter(headless: bool, no_browser: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn status_openrouter() -> Result<()> {
-    match read_provider_key("openrouter")? {
-        Some(_) => println!(
-            "OpenRouter authentication is available at {}.",
-            openrouter_credential_path()?.display()
-        ),
-        None => println!("OpenRouter authentication is not configured."),
-    }
-    Ok(())
-}
-
-pub fn logout_openrouter() -> Result<()> {
-    logout_provider("openrouter", "OpenRouter")
-}
-
 /// Prompt for and save an API key for a provider that does not expose an
 /// OAuth flow (for example OpenCode Go or Vercel AI Gateway).
 pub fn login_api_key(provider: &str, label: &str) -> Result<()> {
@@ -122,27 +116,15 @@ pub fn print_provider_token(provider: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn print_openrouter_token() -> Result<()> {
-    let key = read_openrouter_key()?.context(
-        "OpenRouter authentication is not configured; run `claux auth login openrouter`",
-    )?;
-    println!("{key}");
-    Ok(())
-}
-
-pub fn read_openrouter_key() -> Result<Option<String>> {
-    read_provider_key("openrouter")
-}
-
 fn write_openrouter_key(key: &str) -> Result<()> {
     if key.trim().is_empty() {
         bail!("OpenRouter returned an empty API key");
     }
-    write_provider_key("openrouter", key.trim())
+    write_provider_key(BuiltinProvider::OpenRouter.descriptor().id, key.trim())
 }
 
 fn openrouter_credential_path() -> Result<PathBuf> {
-    provider_credential_path("openrouter")
+    provider_credential_path(BuiltinProvider::OpenRouter.descriptor().id)
 }
 
 pub fn read_provider_key(provider: &str) -> Result<Option<String>> {
@@ -313,7 +295,7 @@ fn code_challenge(verifier: &str) -> String {
 }
 
 fn headless_authorization_url(challenge: &str) -> Result<Url> {
-    let mut url = Url::parse(OPENROUTER_AUTH_URL)?;
+    let mut url = openrouter_auth_url()?;
     url.query_pairs_mut()
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
@@ -322,7 +304,7 @@ fn headless_authorization_url(challenge: &str) -> Result<Url> {
 }
 
 fn callback_authorization_url(challenge: &str, callback: &str) -> Result<Url> {
-    let mut url = Url::parse(OPENROUTER_AUTH_URL)?;
+    let mut url = openrouter_auth_url()?;
     url.query_pairs_mut()
         .append_pair("callback_url", callback)
         .append_pair("code_challenge", challenge)
@@ -407,7 +389,7 @@ fn parse_callback_request(request_line: &str, callback_path: &str) -> Result<Str
 
 async fn exchange_code(code: &str, verifier: &str) -> Result<String> {
     let response = reqwest::Client::new()
-        .post(OPENROUTER_EXCHANGE_URL)
+        .post(format!("{}/auth/keys", openrouter_base()))
         .json(&ExchangeRequest {
             code,
             code_verifier: verifier,
