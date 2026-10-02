@@ -76,6 +76,13 @@ async fn run() -> Result<std::process::ExitCode> {
 
     if let Some(command) = &args.command {
         match command {
+            cli::CliCommand::Archive { session: prefix } => {
+                let (_, path) = session::find_session(prefix)?
+                    .ok_or_else(|| anyhow::anyhow!("Session not found: {prefix}"))?;
+                let archive = session::load_archive(&path)?;
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &archive)?;
+                return Ok(ExitCode::SUCCESS);
+            }
             cli::CliCommand::Auth { command } => {
                 match command {
                     cli::AuthCommand::Login {
@@ -284,7 +291,8 @@ async fn run() -> Result<std::process::ExitCode> {
                 engine.tool_trace(),
                 engine.execution_timing(),
                 outcome,
-            );
+            )
+            .with_archive(engine.archive());
             output::write_transcript(path, &transcript)?;
         }
         let json = matches!(
@@ -383,6 +391,11 @@ async fn run() -> Result<std::process::ExitCode> {
     let mut engine = build_engine(&config, &resolved_model, plugin_registry.clone()).await?;
     if let Some(messages) = resumed_messages {
         engine.set_messages(messages);
+        if let Some(id) = resumed_id.as_ref() {
+            engine.set_archive(session::load_archive(&std::path::PathBuf::from(format!(
+                "sqlite://{id}"
+            )))?);
+        }
     }
     repl::run(engine, &config, plugin_registry, resumed_id, resolved_model)
         .await

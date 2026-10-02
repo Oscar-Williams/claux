@@ -16,10 +16,11 @@ A terminal-based AI coding assistant written in Rust. Streams responses, execute
 - **Model selection** — search configured models by provider, profile, or model when starting a TUI session; `/model <profile>` safely switches providers while preserving the chat
 - **Sub-agents** — Agent tool spawns scoped sub-conversations. Sub-agents inherit the parent session's permission mode, so a sub-agent can't act with more authority than you granted the session. Because sub-agents run non-interactively, any tool the mode would prompt for is denied rather than auto-run (Plan denies all writes; Bypass allows all)
 - **Auto-compact** — triggers when conversation gets large
-- **Task-preserving compaction** — summarizes the intact history into an objective,
-  constraints, decisions, progress, and remaining work while retaining the original
-  request verbatim. Later corrections take precedence. Compaction uses a model
-  request; failed, empty, or non-shrinking summaries leave history unchanged.
+- **Task-preserving compaction** - summarizes older history into an objective,
+  constraints, decisions, progress, and remaining work while retaining recent
+  turns verbatim. Later corrections take precedence. Bounded summary requests
+  recover from overflow; failed, empty, or non-shrinking summaries leave history
+  unchanged. Original conversation messages are archived separately.
 - **Cost tracking** — per-model token usage and USD estimates
 - **Prompt caching** — automatic Anthropic cache breakpoints on the system prompt and conversation, cutting input cost and latency on long sessions
 - **Context assembly** — git status, CLAUDE.md, environment info in system prompt. Checked-in CLAUDE.md is loaded only for trusted projects (the user's `~/.claude/CLAUDE.md` always is), and each file is size-capped
@@ -394,6 +395,44 @@ measure elapsed execution without depending on the host wall clock. Failed
 turns write the partial transcript before returning the error. Failures before
 the engine starts, such as invalid configuration, cannot produce a transcript.
 Claux creates transcript files with private permissions on Unix.
+
+### Conversation compaction and archives
+
+Auto-compaction budgets the incoming prompt, system prompt, tool schemas, and
+reserved response tokens before a model request. The default threshold is 80%
+of the configured context window; `auto_compact_threshold = 0` disables proactive
+compaction. `/compact` runs it manually. `/context` reports the input estimate;
+the response budget is additional headroom used by the compaction decision.
+
+Compaction keeps a recent tail of up to four user turns, bounded by the smaller
+of 16,000 tokens, one eighth of the context window, and one third of the current
+history. Long tool loops can retain a suffix at a boundary with no outstanding
+tool calls. The older prefix becomes a task handoff describing the current
+objective; the first request is no longer pinned indefinitely. Recent images
+remain intact. Older images are represented as attachment markers in summaries.
+
+Summaries use independent provider requests with no tools and at most 4,096
+output tokens, also bounded by the configured response budget and context
+window. Oversized excerpts are folded in chronological chunks. A summary
+overflow halves the chunk budget and retries, with at most three attempts and
+32 chunks per attempt. The active history changes only after all chunks succeed
+and the result reduces context. Repeated summarization remains lossy; older
+requirements depend on the handoff's accuracy.
+
+Interactive sessions store original conversation events in a separate append-only
+SQLite archive. Saving the archive and active context is atomic; compaction does
+not add synthetic handoffs to the archive. Resume restores both. Existing
+sessions seed their archives from the messages still stored at migration time;
+previously discarded history cannot be recovered. Deleting a session deletes
+its archive too. Export a session's archive as JSON with:
+
+```bash
+claux archive <session-id-or-prefix>
+```
+
+One-shot `--transcript` artifacts include an `archive` field alongside the active
+`messages` and tool trace. Tool outputs are still capped before entering model
+history and the archive; archiving does not recover truncated output.
 
 In one-shot mode, `SIGINT` and `SIGTERM` cancel the active provider request or
 tool, pair interrupted tool calls with results, and write the partial
