@@ -641,12 +641,12 @@ In `accept-edits` mode, Agent, MCP, and other non-read-only tools still require
 explicit approval. Sub-agents inherit the parent permission mode; because they
 are non-interactive, operations that would require another prompt are denied.
 
-`auto` mode also runs conservative command families such as `cargo test`,
-`go test`, and read-only Git commands without prompting. It allows sub-agents,
-which inherit the same policy. Unknown or compound Bash commands, external
-mutations, MCP tools, and future mutating tools still require approval. Use
-`bypass` only when every tool call should run without a prompt. Permission
-rules and filesystem containment continue to apply in every mode.
+`auto` mode also runs sandboxed development commands, including compound local
+workflows, without prompting. It allows sub-agents, which inherit the same
+policy. Destructive or privileged commands, remote and publishing actions,
+MCP tools, and future mutating tools still require approval. Use `bypass` only
+when every tool call should run without a prompt. Permission rules and
+filesystem containment continue to apply in every mode.
 
 ### Permission rules
 
