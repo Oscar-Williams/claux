@@ -20,6 +20,7 @@ mod onboarding;
 mod output;
 mod permissions;
 mod plugin;
+mod providers;
 mod query;
 mod repl;
 mod sandbox;
@@ -78,45 +79,35 @@ async fn run() -> Result<std::process::ExitCode> {
             cli::CliCommand::Auth { command } => {
                 match command {
                     cli::AuthCommand::Login {
-                        provider: cli::AuthProvider::OpenRouter,
+                        provider,
                         headless,
                         no_browser,
-                    } => auth::login_openrouter(*headless, *no_browser).await?,
-                    cli::AuthCommand::Status {
-                        provider: cli::AuthProvider::OpenRouter,
-                    } => auth::status_openrouter()?,
-                    cli::AuthCommand::Logout {
-                        provider: cli::AuthProvider::OpenRouter,
-                    } => auth::logout_openrouter()?,
-                    cli::AuthCommand::Token {
-                        provider: cli::AuthProvider::OpenRouter,
-                    } => auth::print_openrouter_token()?,
-                    cli::AuthCommand::Login {
-                        provider: cli::AuthProvider::OpenCodeGo,
-                        ..
-                    } => auth::login_api_key("opencode-go", "OpenCode Go")?,
-                    cli::AuthCommand::Status {
-                        provider: cli::AuthProvider::OpenCodeGo,
-                    } => auth::status_provider("opencode-go", "OpenCode Go")?,
-                    cli::AuthCommand::Logout {
-                        provider: cli::AuthProvider::OpenCodeGo,
-                    } => auth::logout_provider("opencode-go", "OpenCode Go")?,
-                    cli::AuthCommand::Token {
-                        provider: cli::AuthProvider::OpenCodeGo,
-                    } => auth::print_provider_token("opencode-go", "OpenCode Go")?,
-                    cli::AuthCommand::Login {
-                        provider: cli::AuthProvider::Vercel,
-                        ..
-                    } => auth::login_api_key("vercel", "Vercel AI Gateway")?,
-                    cli::AuthCommand::Status {
-                        provider: cli::AuthProvider::Vercel,
-                    } => auth::status_provider("vercel", "Vercel AI Gateway")?,
-                    cli::AuthCommand::Logout {
-                        provider: cli::AuthProvider::Vercel,
-                    } => auth::logout_provider("vercel", "Vercel AI Gateway")?,
-                    cli::AuthCommand::Token {
-                        provider: cli::AuthProvider::Vercel,
-                    } => auth::print_provider_token("vercel", "Vercel AI Gateway")?,
+                    } => {
+                        let descriptor = provider.0.descriptor();
+                        match descriptor.auth {
+                            providers::AuthFlow::OpenRouterPkce => {
+                                auth::login_openrouter(*headless, *no_browser).await?
+                            }
+                            providers::AuthFlow::ApiKey => {
+                                auth::login_api_key(descriptor.id, descriptor.label)?
+                            }
+                            providers::AuthFlow::None => {
+                                anyhow::bail!("provider has no login integration")
+                            }
+                        }
+                    }
+                    cli::AuthCommand::Status { provider } => {
+                        let descriptor = provider.0.descriptor();
+                        auth::status_provider(descriptor.id, descriptor.label)?;
+                    }
+                    cli::AuthCommand::Logout { provider } => {
+                        let descriptor = provider.0.descriptor();
+                        auth::logout_provider(descriptor.id, descriptor.label)?;
+                    }
+                    cli::AuthCommand::Token { provider } => {
+                        let descriptor = provider.0.descriptor();
+                        auth::print_provider_token(descriptor.id, descriptor.label)?;
+                    }
                 }
                 return Ok(ExitCode::SUCCESS);
             }
@@ -453,16 +444,10 @@ fn build_provider(resolved: &config::ResolvedModel) -> Result<Box<dyn api::Provi
     let binding = &resolved.binding;
     let api_key = resolved.resolve_api_key().unwrap_or_default();
     if api_key.is_empty() && resolved.requires_api_key() {
-        let login_hint = if binding.provider_name.eq_ignore_ascii_case("openrouter")
-            || binding
-                .base_url
-                .as_deref()
-                .is_some_and(|url| url.contains("openrouter.ai"))
-        {
-            " or run `claux auth login openrouter`"
-        } else {
-            ""
-        };
+        let login_hint = providers::for_binding(binding)
+            .filter(|descriptor| descriptor.auth != providers::AuthFlow::None)
+            .map(|descriptor| format!(" or run `claux auth login {}`", descriptor.id))
+            .unwrap_or_default();
         anyhow::bail!(
             "No API key found for profile '{}' (provider '{}'). Set {}{} or update \
              ~/.config/claux/config.toml.",

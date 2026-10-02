@@ -7,7 +7,11 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+fn openrouter_api_base() -> &'static str {
+    crate::providers::BuiltinProvider::OpenRouter
+        .descriptor()
+        .base_url
+}
 const MAX_REQUEST_ATTEMPTS: usize = 6;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const WRAPPER_PREFIX: &str = "CLX_TOKENIZER_FINGERPRINT_BEGIN\n";
@@ -267,12 +271,7 @@ fn validate_models(models: &[String], catalog: &HashMap<String, Option<String>>)
 }
 
 fn openrouter_key() -> Result<String> {
-    if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-        if !key.trim().is_empty() {
-            return Ok(key);
-        }
-    }
-    crate::auth::read_openrouter_key()?.context(
+    crate::providers::BuiltinProvider::OpenRouter.descriptor().api_key()?.context(
         "OpenRouter authentication is not configured; set OPENROUTER_API_KEY or run `claux auth login openrouter`",
     )
 }
@@ -316,7 +315,7 @@ async fn count_prompt(
 ) -> Result<(u64, Option<f64>)> {
     for attempt in 0..MAX_REQUEST_ATTEMPTS {
         let response = client
-            .post(format!("{OPENROUTER_API_BASE}/chat/completions"))
+            .post(format!("{}/chat/completions", openrouter_api_base()))
             .bearer_auth(api_key)
             .json(&json!({
                 "model": model,
@@ -383,7 +382,7 @@ async fn fetch_model_catalog(
     api_key: &str,
 ) -> Result<HashMap<String, Option<String>>> {
     let response = client
-        .get(format!("{OPENROUTER_API_BASE}/models"))
+        .get(format!("{}/models", openrouter_api_base()))
         .bearer_auth(api_key)
         .send()
         .await

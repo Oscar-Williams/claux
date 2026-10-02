@@ -96,6 +96,11 @@ created with private permissions. Run `config init` again with another provider
 to add it without replacing existing settings or comments. `--force` explicitly
 starts over.
 
+Built-in provider defaults and capabilities share one registry. Explicit
+`base_url`, `protocol`, and `api_key_env` settings remain authoritative, including
+for gateways. `doctor` probes the configured endpoint. Hosted built-ins require
+a key; generic compatible endpoints and Ollama can remain keyless.
+
 The TUI opens on the session browser. Starting a session lets you choose one
 named model profile; opening an existing session restores its exact provider,
 endpoint, protocol, and model:
@@ -220,7 +225,8 @@ configured usage endpoint are reported as unavailable; Claux never renders an
 unknown balance as zero.
 
 OpenCode Go can be queried explicitly with `claux usage status opencode-go` when
-`OPENCODE_GO_API_KEY` (or `OPENCODE_API_KEY`) is set. It reports the account-wide
+`OPENCODE_GO_API_KEY` (or `OPENCODE_API_KEY`) is set, or a key was saved with
+`claux auth login opencode-go`. It reports the account-wide
 rolling 5-hour, weekly, and monthly usage windows and reset times. OpenCode Go's
 credit-wallet balance is separate and is not exposed by that endpoint.
 
@@ -243,6 +249,10 @@ For each named provider, claux resolves authentication in order:
 2. `api_key_cmd` (shell command that returns a key)
 3. The provider's `api_key_env` environment variable
 4. A credential saved by `claux auth login` for that provider
+
+Provider usage commands also prefer a nonblank environment key over a saved
+credential. OpenCode Go accepts its legacy `OPENCODE_API_KEY` variable after
+`OPENCODE_GO_API_KEY` when using the built-in key environment.
 
 Claude Free, Pro, and Max subscription credentials are not supported. Use an
 Anthropic API key or an OpenAI-compatible endpoint such as OpenRouter.

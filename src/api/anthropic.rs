@@ -20,7 +20,13 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: AnthropicApiKey, model: &str) -> Self {
-        Self::with_base_url(api_key, model, "https://api.anthropic.com/v1")
+        Self::with_base_url(
+            api_key,
+            model,
+            crate::providers::BuiltinProvider::Anthropic
+                .descriptor()
+                .base_url,
+        )
     }
 
     pub fn with_base_url(api_key: AnthropicApiKey, model: &str, base_url: &str) -> Self {

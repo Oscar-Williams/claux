@@ -7,8 +7,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const OPENROUTER_KEY_URL: &str = "https://openrouter.ai/api/v1/key";
-const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+use crate::providers::{BuiltinProvider, UsageIntegration};
+
+fn usage_url(provider: BuiltinProvider) -> &'static str {
+    provider.descriptor().usage.expect("usage integration").1
+}
 
 #[derive(Debug, Serialize)]
 struct UsageReport {
@@ -84,11 +87,11 @@ struct OpenCodeGoUsageResponse {
 /// Print provider usage status in text or JSON form.
 pub async fn status(provider: Option<&str>, json: bool) -> Result<()> {
     let provider = provider.unwrap_or("openrouter").trim().to_ascii_lowercase();
-    let report = match provider.as_str() {
-        "openrouter" => openrouter_status().await?,
-        "opencode" | "opencode-go" => opencode_go_status().await?,
-        other => unsupported_report(
-            other,
+    let report = match crate::providers::named(&provider).and_then(|p| p.usage) {
+        Some((UsageIntegration::OpenRouter, _)) => openrouter_status().await?,
+        Some((UsageIntegration::OpenCodeGo, _)) => opencode_go_status().await?,
+        None => unsupported_report(
+            &provider,
             "This provider does not expose a usage-status integration in Claux yet.",
         ),
     };
@@ -102,17 +105,13 @@ pub async fn status(provider: Option<&str>, json: bool) -> Result<()> {
 }
 
 async fn openrouter_status() -> Result<UsageReport> {
-    let key = crate::auth::read_openrouter_key()?.or_else(|| {
-        std::env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    });
+    let key = BuiltinProvider::OpenRouter.descriptor().api_key()?;
     let Some(key) = key else {
         return Ok(UsageReport {
             schema_version: 1,
             provider: "openrouter".to_owned(),
             status: UsageStatus::NotConfigured,
-            source: Some(OPENROUTER_KEY_URL.to_owned()),
+            source: Some(usage_url(BuiltinProvider::OpenRouter).to_owned()),
             details: None,
             message: Some(
                 "No OpenRouter credential found; run `claux auth login openrouter` or set OPENROUTER_API_KEY.".to_owned(),
@@ -127,7 +126,7 @@ async fn openrouter_status() -> Result<UsageReport> {
         .build()
         .context("could not create the OpenRouter usage client")?;
     let response = client
-        .get(OPENROUTER_KEY_URL)
+        .get(usage_url(BuiltinProvider::OpenRouter))
         .bearer_auth(key)
         .send()
         .await
@@ -145,7 +144,7 @@ async fn openrouter_status() -> Result<UsageReport> {
         schema_version: 1,
         provider: "openrouter".to_owned(),
         status: UsageStatus::Available,
-        source: Some(OPENROUTER_KEY_URL.to_owned()),
+        source: Some(usage_url(BuiltinProvider::OpenRouter).to_owned()),
         details: Some(UsageDetails::OpenRouter(payload.data)),
         message: None,
         notes: vec![
@@ -156,20 +155,14 @@ async fn openrouter_status() -> Result<UsageReport> {
 }
 
 async fn opencode_go_status() -> Result<UsageReport> {
-    let key = std::env::var("OPENCODE_GO_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("OPENCODE_API_KEY")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        });
+    let descriptor = BuiltinProvider::OpenCodeGo.descriptor();
+    let key = descriptor.api_key()?;
     let Some(key) = key else {
         return Ok(UsageReport {
             schema_version: 1,
             provider: "opencode-go".to_owned(),
             status: UsageStatus::NotConfigured,
-            source: Some(OPENCODE_GO_USAGE_URL.to_owned()),
+            source: Some(usage_url(BuiltinProvider::OpenCodeGo).to_owned()),
             details: None,
             message: Some(
                 "No OpenCode Go API key found; set OPENCODE_GO_API_KEY (or OPENCODE_API_KEY)."
@@ -189,7 +182,7 @@ async fn opencode_go_status() -> Result<UsageReport> {
         .build()
         .context("could not create the OpenCode Go usage client")?;
     let response = client
-        .get(OPENCODE_GO_USAGE_URL)
+        .get(usage_url(BuiltinProvider::OpenCodeGo))
         .bearer_auth(key)
         .send()
         .await
@@ -200,7 +193,7 @@ async fn opencode_go_status() -> Result<UsageReport> {
             schema_version: 1,
             provider: "opencode-go".to_owned(),
             status: UsageStatus::Unavailable,
-            source: Some(OPENCODE_GO_USAGE_URL.to_owned()),
+            source: Some(usage_url(BuiltinProvider::OpenCodeGo).to_owned()),
             details: None,
             message: Some("OpenCode Go rejected the supplied API key.".to_owned()),
             notes: Vec::new(),
@@ -211,7 +204,7 @@ async fn opencode_go_status() -> Result<UsageReport> {
             schema_version: 1,
             provider: "opencode-go".to_owned(),
             status: UsageStatus::Unavailable,
-            source: Some(OPENCODE_GO_USAGE_URL.to_owned()),
+            source: Some(usage_url(BuiltinProvider::OpenCodeGo).to_owned()),
             details: None,
             message: Some("The supplied key does not have an OpenCode Go subscription.".to_owned()),
             notes: Vec::new(),
@@ -229,7 +222,7 @@ async fn opencode_go_status() -> Result<UsageReport> {
         schema_version: 1,
         provider: "opencode-go".to_owned(),
         status: UsageStatus::Available,
-        source: Some(OPENCODE_GO_USAGE_URL.to_owned()),
+        source: Some(usage_url(BuiltinProvider::OpenCodeGo).to_owned()),
         details: Some(UsageDetails::OpenCodeGo(payload.usage)),
         message: None,
         notes: vec![

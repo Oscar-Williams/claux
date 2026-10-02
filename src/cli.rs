@@ -1,3 +1,4 @@
+pub use crate::providers::{AuthProvider, BuiltinProvider as ConfigProvider};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -167,16 +168,6 @@ pub enum UsageCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum AuthProvider {
-    #[value(name = "openrouter")]
-    OpenRouter,
-    #[value(name = "opencode-go", alias = "opencode")]
-    OpenCodeGo,
-    #[value(name = "vercel")]
-    Vercel,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum TokenizerOutputFormat {
     #[default]
@@ -201,18 +192,6 @@ pub enum ConfigCommand {
         #[arg(long)]
         force: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum ConfigProvider {
-    Anthropic,
-    Openai,
-    #[value(name = "openrouter")]
-    OpenRouter,
-    #[value(name = "opencode-go", alias = "opencode")]
-    OpenCodeGo,
-    Vercel,
-    Ollama,
 }
 
 #[cfg(test)]
@@ -309,7 +288,7 @@ mod tests {
             cli.command,
             Some(CliCommand::Auth {
                 command: AuthCommand::Login {
-                    provider: AuthProvider::OpenRouter,
+                    provider: AuthProvider(ConfigProvider::OpenRouter),
                     headless: true,
                     no_browser: true,
                 },
@@ -324,7 +303,7 @@ mod tests {
             opencode.command,
             Some(CliCommand::Auth {
                 command: AuthCommand::Login {
-                    provider: AuthProvider::OpenCodeGo,
+                    provider: AuthProvider(ConfigProvider::OpenCodeGo),
                     ..
                 },
             })
@@ -335,7 +314,7 @@ mod tests {
             vercel.command,
             Some(CliCommand::Auth {
                 command: AuthCommand::Login {
-                    provider: AuthProvider::Vercel,
+                    provider: AuthProvider(ConfigProvider::Vercel),
                     ..
                 },
             })
@@ -346,7 +325,7 @@ mod tests {
             alias.command,
             Some(CliCommand::Auth {
                 command: AuthCommand::Status {
-                    provider: AuthProvider::OpenCodeGo,
+                    provider: AuthProvider(ConfigProvider::OpenCodeGo),
                 },
             })
         ));
