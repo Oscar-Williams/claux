@@ -141,34 +141,51 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_child() {
+        use futures_util::FutureExt;
+        use std::{panic::AssertUnwindSafe, time::Duration};
+
         let Ok(scenario) = std::env::var("CLAUX_TERMINAL_TEST_SCENARIO") else {
             return;
         };
         let ready = std::env::var("CLAUX_TERMINAL_TEST_READY").unwrap();
         let release = std::env::var("CLAUX_TERMINAL_TEST_RELEASE").unwrap();
-        let handshake = || {
-            std::fs::write(&ready, "ready").unwrap();
-            while !std::path::Path::new(&release).exists() {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+        let restored = std::env::var("CLAUX_TERMINAL_TEST_RESTORED").unwrap();
+        let checked = std::env::var("CLAUX_TERMINAL_TEST_CHECKED").unwrap();
+        let handshake = |ready: &str, release: &str| {
+            std::fs::write(ready, "ready").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !std::path::Path::new(release).exists() {
+                assert!(std::time::Instant::now() < deadline, "PTY parent timed out");
+                std::thread::sleep(Duration::from_millis(5));
             }
         };
-        if scenario == "startup_error" {
-            assert!(TerminalGuard::enter_with(|_| {
-                handshake();
-                Err(io::Error::other("terminal initialization failed"))
-            })
-            .is_err());
-            return;
-        }
-        let shutdown = crate::shutdown::TuiShutdown::listen().unwrap();
-        let mut guard = TerminalGuard::enter().unwrap();
-        handshake();
-        match scenario.as_str() {
-            "drop" => {}
-            "explicit" => guard.restore().unwrap(),
-            "panic" => panic!("terminal unwind regression"),
-            "signal" => shutdown.token.cancelled().await,
-            _ => panic!("unknown scenario"),
+        let result = AssertUnwindSafe(async {
+            if scenario == "startup_error" {
+                assert!(TerminalGuard::enter_with(|_| {
+                    handshake(&ready, &release);
+                    Err(io::Error::other("terminal initialization failed"))
+                })
+                .is_err());
+                return;
+            }
+            let shutdown = crate::shutdown::TuiShutdown::listen().unwrap();
+            let mut guard = TerminalGuard::enter().unwrap();
+            handshake(&ready, &release);
+            match scenario.as_str() {
+                "drop" => {}
+                "explicit" => guard.restore().unwrap(),
+                "panic" => panic!("terminal unwind regression"),
+                "signal" => shutdown.token.cancelled().await,
+                _ => panic!("unknown scenario"),
+            }
+        })
+        .catch_unwind()
+        .await;
+        // macOS revokes the controlling PTY when its session leader exits.
+        // Check after guard cleanup (including unwinding), but before exit.
+        handshake(&restored, &checked);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
         }
     }
 
@@ -205,12 +222,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let release = dir.path().join("release");
+        let restored = dir.path().join("restored");
+        let checked = dir.path().join("checked");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "tui::terminal::tests::pty_child", "--nocapture"])
             .env("CLAUX_TERMINAL_TEST_SCENARIO", scenario)
             .env("CLAUX_TERMINAL_TEST_READY", &ready)
             .env("CLAUX_TERMINAL_TEST_RELEASE", &release)
+            .env("CLAUX_TERMINAL_TEST_RESTORED", &restored)
+            .env("CLAUX_TERMINAL_TEST_CHECKED", &checked)
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
@@ -249,6 +270,17 @@ mod tests {
         if let Some(signal) = signal {
             kill(Pid::from_raw(child.id() as i32), signal).unwrap();
         }
+        while !restored.exists() {
+            if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("PTY child failed to finish terminal cleanup");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = tcgetattr(&slave);
+        // Let the child exit even if the restoration assertion will fail.
+        std::fs::write(&checked, "continue").unwrap();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -261,11 +293,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(status.success(), scenario != "panic");
-        assert_eq!(
-            tcgetattr(&slave).unwrap(),
-            before,
-            "terminal modes were not restored"
-        );
+        assert_eq!(after.unwrap(), before, "terminal modes were not restored");
         drop(command);
         drop(slave);
         let output = reader.join().unwrap();
