@@ -293,7 +293,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(status.success(), scenario != "panic");
-        assert_eq!(after.unwrap(), before, "terminal modes were not restored");
+        assert_eq!(
+            comparable_terminal_settings(after.unwrap()),
+            comparable_terminal_settings(before),
+            "terminal modes were not restored"
+        );
         drop(command);
         drop(slave);
         let output = reader.join().unwrap();
@@ -301,6 +305,47 @@ mod tests {
         for reset in ["\x1b[?2004l", "\x1b[?1049l", "\x1b[0m", "\x1b[?25h"] {
             assert!(output.contains(reset), "missing terminal reset {reset:?}");
         }
+    }
+
+    fn comparable_terminal_settings(
+        settings: nix::sys::termios::Termios,
+    ) -> nix::sys::termios::Termios {
+        // Normalize the underlying struct too: nix's equality includes both
+        // its cached libc termios and the public flag fields.
+        let settings: nix::libc::termios = settings.into();
+        #[cfg(target_os = "macos")]
+        let settings = {
+            let mut settings = settings;
+            // Darwin sets this transient input-reprocessing flag when ICANON
+            // is restored, even when the saved settings did not contain it.
+            settings.c_lflag &= !nix::libc::PENDIN;
+            settings
+        };
+        settings.into()
+    }
+
+    #[test]
+    fn terminal_comparison_ignores_only_macos_pending_input() {
+        use nix::{pty::openpty, sys::termios::tcgetattr};
+
+        let pty = openpty(None, None).unwrap();
+        let mut original: nix::libc::termios = tcgetattr(&pty.slave).unwrap().into();
+        original.c_lflag &= !nix::libc::PENDIN;
+        let expected = comparable_terminal_settings(original.into());
+        let mut pending = original;
+        pending.c_lflag |= nix::libc::PENDIN;
+        assert_eq!(
+            comparable_terminal_settings(pending.into()) == expected,
+            cfg!(target_os = "macos")
+        );
+        for flag in [nix::libc::ECHO, nix::libc::ICANON, nix::libc::ISIG] {
+            let mut changed = original;
+            changed.c_lflag ^= flag;
+            assert_ne!(comparable_terminal_settings(changed.into()), expected);
+        }
+        let mut changed = original;
+        changed.c_cc[nix::libc::VMIN] ^= 1;
+        assert_ne!(comparable_terminal_settings(changed.into()), expected);
     }
 
     #[cfg(unix)]
