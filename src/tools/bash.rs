@@ -230,7 +230,7 @@ impl Tool for BashTool {
         // in the command's process tree before draining output. Persistent
         // services must detach into their own service manager and redirect
         // their streams rather than inheriting a tool invocation's pipes.
-        let residual_processes_terminated = terminate_process_tree(&mut child, process_group);
+        let cleanup = terminate_process_tree(&mut child, process_group);
 
         if !matches!(outcome, Outcome::Finished(_)) {
             let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, wait_for_parent(&mut child)).await;
@@ -285,7 +285,7 @@ impl Tool for BashTool {
         };
 
         if matches!(outcome, Outcome::Finished(Ok(status)) if status.success())
-            && residual_processes_terminated
+            && matches!(cleanup, Ok(true))
         {
             if !content.is_empty() {
                 content.push('\n');
@@ -293,6 +293,14 @@ impl Tool for BashTool {
             content.push_str(
                 "Background processes were terminated when the command exited. Use a service manager for persistent processes.",
             );
+            is_error = true;
+        }
+
+        if let Err(error) = cleanup {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&format!("Failed to clean up command process tree: {error}"));
             is_error = true;
         }
 
@@ -325,21 +333,30 @@ async fn wait_for_parent(
 fn terminate_process_tree(
     _child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
     process_group: Option<u32>,
-) -> bool {
+) -> std::io::Result<bool> {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
-    process_group
-        .and_then(|pid| i32::try_from(pid).ok())
-        .is_some_and(|pid| killpg(Pid::from_raw(pid), Signal::SIGKILL).is_ok())
+    let Some(pid) = process_group.and_then(|pid| i32::try_from(pid).ok()) else {
+        return Ok(false);
+    };
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(not(unix))]
 fn terminate_process_tree(
     child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
     _process_group: Option<u32>,
-) -> bool {
-    child.start_kill().is_ok()
+) -> std::io::Result<bool> {
+    child.start_kill()?;
+    // TerminateJobObject also succeeds for an empty job. The wrapper does
+    // not expose its active process count, so success is not evidence that
+    // descendants remained. Still terminate the job to prevent leaks.
+    Ok(false)
 }
 
 async fn drain_reader(task: &mut JoinHandle<()>) -> bool {
@@ -454,8 +471,24 @@ mod tests {
             .execute(json!({"command": "echo hello"}), token())
             .await
             .unwrap();
-        assert!(!result.is_error);
+        assert!(!result.is_error, "{}", result.content);
         assert!(result.content.trim().contains("hello"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn completed_windows_job_cleanup_does_not_report_residual_processes() {
+        let mut inner = tokio::process::Command::new("cmd.exe");
+        inner.args(["/C", "exit 0"]);
+        let mut command = CommandWrap::from(inner);
+        command.wrap(KillOnDrop).wrap(JobObject);
+        let mut child = command.spawn().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), wait_for_parent(&mut child))
+            .await
+            .expect("command must exit promptly")
+            .unwrap();
+        assert!(status.success());
+        assert!(!terminate_process_tree(&mut child, None).unwrap());
     }
 
     #[tokio::test]
